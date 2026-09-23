@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LitMark</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Lora:ital,wght@0,400;0,500;0,600;1,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#FAF9F4;
+    --paper-dim:#F1EFE7;
+    --ink:#1B1D24;
+    --ink-soft:#5B5D66;
+    --rule:#D9D5C7;
+    --mark:#CFE36A;
+    --mark-edge:#B9D14A;
+    --link:#2C5F6F;
+    --link-dim:#7E97A0;
+    box-sizing:border-box;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#181A20; --paper-dim:#1F2128; --ink:#EDEBE3; --ink-soft:#9A9C A6;
+      --ink-soft:#9EA0AA; --rule:#33353D; --mark:#8FA83A; --mark-edge:#7B9430;
+      --link:#7FB3C4; --link-dim:#5E7480;
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#181A20; --paper-dim:#1F2128; --ink:#EDEBE3; --ink-soft:#9EA0AA;
+    --rule:#33353D; --mark:#8FA83A; --mark-edge:#7B9430; --link:#7FB3C4; --link-dim:#5E7480;
+  }
+  html{scroll-padding-top:env(safe-area-inset-top,0px);}
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:'Inter',sans-serif; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:760px; margin:0 auto; padding:56px 24px 100px;}
+
+  header.brand{display:flex; align-items:baseline; justify-content:space-between; margin-bottom:44px;}
+  .brand h1{font-family:'Lora',serif; font-weight:600; font-size:26px; margin:0; letter-spacing:-0.01em;}
+  .brand h1 span{background:linear-gradient(180deg, transparent 62%, var(--mark) 62%); padding:0 2px;}
+  .brand .tag{font-size:13px; color:var(--ink-soft);}
+
+  .prompt-block{border-bottom:1px solid var(--rule); padding-bottom:28px; margin-bottom:8px;}
+  .prompt-block label{display:block; font-size:14px; color:var(--ink-soft); margin-bottom:10px;}
+  .input-row{display:flex; gap:10px; align-items:flex-end;}
+  textarea{
+    flex:1; resize:none; border:none; border-bottom:1.5px solid var(--ink);
+    background:transparent; font-family:'Lora',serif; font-size:19px; line-height:1.5;
+    color:var(--ink); padding:6px 2px 10px; outline:none; min-height:30px;
+  }
+  textarea::placeholder{color:var(--ink-soft); font-style:italic;}
+  button.go{
+    flex-shrink:0; background:var(--ink); color:var(--paper); border:none;
+    font-family:'Inter',sans-serif; font-weight:500; font-size:14px;
+    padding:11px 18px; cursor:pointer; border-radius:2px; transition:opacity .15s;
+  }
+  button.go:hover{opacity:.85;}
+  button.go:disabled{opacity:.4; cursor:default;}
+  button.go:focus-visible, textarea:focus-visible{outline:2px solid var(--link); outline-offset:2px;}
+
+  .examples{margin-top:14px; font-size:13px; color:var(--ink-soft);}
+  .examples button{
+    background:none; border:none; color:var(--link); font-size:13px; cursor:pointer;
+    padding:0; text-decoration:underline; text-underline-offset:2px; font-family:'Inter',sans-serif;
+  }
+
+  .status{font-size:14px; color:var(--ink-soft); margin:26px 0 4px; min-height:20px;}
+  .status.searching::after{content:''; display:inline-block; width:6px;}
+
+  .caveat{font-size:12.5px; color:var(--ink-soft); border-left:2px solid var(--rule); padding-left:10px; margin:10px 0 34px; line-height:1.55;}
+
+  .results{list-style:none; margin:0; padding:0;}
+  .paper{border-bottom:1px solid var(--rule); padding:26px 0;}
+  .paper:first-of-type{padding-top:6px;}
+  .meta-row{display:flex; align-items:center; gap:10px; font-size:12.5px; color:var(--ink-soft); margin-bottom:8px;}
+  .source-tag{color:var(--link);}
+  .dot{width:3px; height:3px; border-radius:50%; background:var(--rule);}
+  .paper h3{font-family:'Lora',serif; font-weight:500; font-size:18px; line-height:1.4; margin:0 0 6px; cursor:pointer;}
+  .paper h3:hover{color:var(--link);}
+  .authors{font-size:13.5px; color:var(--ink-soft); margin-bottom:12px;}
+  .excerpt{font-family:'Lora',serif; font-size:15.5px; line-height:1.7; color:var(--ink); max-width:64ch;}
+  .excerpt mark{
+    background:var(--mark); color:var(--ink); padding:0.02em 0.15em;
+    box-shadow:0 0 0 0.5px var(--mark-edge); border-radius:1px;
+  }
+  .why{font-size:13px; color:var(--ink-soft); margin-top:10px; display:none; font-style:italic;}
+  .paper.open .why{display:block;}
+
+  .relevance{display:flex; align-items:center; gap:8px; margin-left:auto; flex-shrink:0;}
+  .relevance .num{font-family:'Lora',serif; font-size:13px; color:var(--ink);}
+  .meter{width:44px; height:3px; background:var(--rule); position:relative;}
+  .meter i{position:absolute; left:0; top:0; height:100%; background:var(--ink-soft); display:block;}
+
+  .empty{color:var(--ink-soft); font-size:14.5px; font-style:italic; padding:20px 0;}
+
+  @media (max-width:520px){
+    .wrap{padding:36px 18px 80px;}
+    .input-row{flex-direction:column; align-items:stretch;}
+    button.go{align-self:flex-end;}
+    .meta-row{flex-wrap:wrap;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="brand">
+    <h1>Lit<span>Mark</span></h1>
+    <div class="tag">for the essay you haven't started yet</div>
+  </header>
+
+  <div style="font-size:12.5px; color:var(--ink-soft); margin:-30px 0 30px;">
+    <button id="cfgToggle" style="background:none;border:none;color:var(--link);font-size:12.5px;cursor:pointer;padding:0;text-decoration:underline;text-underline-offset:2px;font-family:'Inter',sans-serif;">⚙ backend</button>
+    <span id="cfgRow" style="display:none; margin-top:6px;">
+      <input id="apiBase" type="text" placeholder="https://api.litmark.co.uk" style="font-family:'Inter',sans-serif; font-size:12.5px; border:1px solid var(--rule); background:var(--paper-dim); color:var(--ink); padding:4px 8px; width:220px; border-radius:2px;">
+      <span id="cfgSaved" style="margin-left:6px;"></span>
+    </span>
+  </div>
+
+  <div class="prompt-block">
+    <label for="q">Your assessment title or research question</label>
+    <div class="input-row">
+      <textarea id="q" rows="1" placeholder="e.g. Does intermittent fasting improve insulin sensitivity in adults with type 2 diabetes?"></textarea>
+      <button class="go" id="go">Find sources</button>
+    </div>
+    <div class="examples">Try: 
+      <button data-ex="0">insulin sensitivity</button> · 
+      <button data-ex="1">social media and adolescent anxiety</button> · 
+      <button data-ex="2">CRISPR gene editing ethics</button>
+    </div>
+  </div>
+
+  <div class="status" id="status"></div>
+  <div class="caveat">This page calls a LitMark backend server for real results from OpenAlex and Semantic Scholar, filtered to open-access papers only. If no backend is reachable (see ⚙ backend above), it falls back to sample data so you can still see how it behaves.</div>
+
+  <ul class="results" id="results"></ul>
+  <div class="empty" id="empty">Results will appear here once you run a search.</div>
+
+</div>
+
+<script>
+const DATASETS = {
+  default: [
+    {source:'PubMed', year:2023, journal:'Diabetes Care', title:'Time-restricted eating and glycaemic control in type 2 diabetes: a randomised trial', authors:'Hutchison A, Regmi P, Manoogian ENC, et al.', score:94,
+     excerpt:"Participants following a 9-hour eating window for 12 weeks showed a mean reduction in HOMA-IR of 1.8 points, with ", mark:"insulin sensitivity improving independently of total weight loss", tail:", suggesting a direct metabolic effect of meal timing.",
+     why:'Directly measures insulin sensitivity as a primary outcome in a controlled trial — strong support for a causal claim.'},
+    {source:'Google Scholar', year:2021, journal:'Cell Metabolism', title:'Circadian misalignment and peripheral insulin resistance', authors:'Wefers J, van Moorsel D, Hansen J, et al.', score:88,
+     excerpt:"Shifting the feeding window later by four hours ", mark:"reduced peripheral glucose uptake by roughly 18% in muscle tissue", tail:" over a five-day intervention, independent of sleep duration.",
+     why:'Mechanistic evidence for why timing (not just calories) affects insulin action — useful for your discussion section.'},
+    {source:'PubMed', year:2020, journal:'JAMA Internal Medicine', title:'Alternate-day fasting versus daily calorie restriction in obese adults', authors:'Trepanowski JF, Kroeger CM, Barnosky A, et al.', score:71,
+     excerpt:"At 12 months, ", mark:"insulin resistance markers did not differ significantly between the two dietary strategies", tail:", though adherence was lower in the alternate-day group.",
+     why:'A useful counterpoint — shows fasting pattern may matter less than total adherence, good for a balanced argument.'},
+    {source:'Semantic Scholar', year:2018, journal:'Cell Research', title:'Metabolic effects of intermittent fasting in murine models', authors:'Mattson MP, Longo VD, Harvie M.', score:52,
+     excerpt:"In rodent models, alternating fasting cycles ", mark:"upregulated AMPK signalling and improved glucose tolerance", tail:", though translation to human physiology remains uncertain.",
+     why:'Mechanistic but animal-only data — cite carefully, flag as preclinical evidence rather than direct human support.'}
+  ],
+  anxiety: [
+    {source:'PubMed', year:2022, journal:'JAMA Psychiatry', title:'Social media use and adolescent depressive symptoms: a longitudinal cohort study', authors:'Riehm KE, Feder KA, Tormohlen KN, et al.', score:91,
+     excerpt:"Adolescents in the highest tertile of daily use showed ", mark:"a 2.4-fold increase in odds of elevated anxiety symptoms at one-year follow-up", tail:", after adjusting for baseline mental health.",
+     why:'Longitudinal design strengthens the temporal claim — this is your strongest causal-adjacent evidence.'},
+    {source:'Google Scholar', year:2021, journal:'Nature Human Behaviour', title:'Association, not causation: re-examining social media and wellbeing', authors:'Orben A, Przybylski AK.', score:79,
+     excerpt:"Across three large panel datasets, ", mark:"effect sizes for social media use on wellbeing were consistently small", tail:", comparable to the effect of eating potatoes.",
+     why:'Important counter-evidence on effect size — cite this to show you\'ve engaged with the strongest opposing view.'},
+    {source:'PubMed', year:2019, journal:'Clinical Psychological Science', title:'Digital screen time and youth mental health: a preregistered analysis', authors:'Przybylski AK, Weinstein N.', score:66,
+     excerpt:"Using preregistered thresholds, ", mark:"screen time explained less than 1% of variance in adolescent wellbeing", tail:", far below effects of sleep and family conflict.",
+     why:'Good for nuance — supports the argument that screen time is a minor factor relative to other predictors.'}
+  ],
+  crispr: [
+    {source:'PubMed', year:2023, journal:'The Lancet', title:'Germline genome editing: revisiting the ethical consensus after clinical trials', authors:'Baylis F, Darnovsky M, Hasson K.', score:90,
+     excerpt:"Following the 2018 germline editing case, professional bodies converged on a position that ", mark:"heritable editing remains ethically impermissible outside tightly regulated trials", tail:", though several argue this consensus is fragile.",
+     why:'Directly frames the current ethical consensus — good anchor point for your argument\'s opening.'},
+    {source:'Google Scholar', year:2020, journal:'Nature Biotechnology', title:'Public attitudes toward human germline editing across 20 countries', authors:'Uchiyama R, Curry O, Lehmann J.', score:74,
+     excerpt:"Support for editing to treat disease exceeded 70% across most surveyed populations, but ", mark:"support collapsed below 25% for non-therapeutic enhancement uses", tail:", revealing a sharp treatment-enhancement divide.",
+     why:'Useful empirical grounding for the treatment vs. enhancement distinction central to most ethics essays on this topic.'}
+  ]
+};
+
+const examples = [
+ 'Does intermittent fasting improve insulin sensitivity in adults with type 2 diabetes?',
+ 'To what extent does social media use contribute to anxiety in adolescents?',
+ 'Is germline CRISPR editing ethically justifiable for non-disease traits?'
+];
+const exKeys = ['default','anxiety','crispr'];
+
+const qEl = document.getElementById('q');
+const goBtn = document.getElementById('go');
+const statusEl = document.getElementById('status');
+const resultsEl = document.getElementById('results');
+const emptyEl = document.getElementById('empty');
+const apiBaseEl = document.getElementById('apiBase');
+const cfgToggle = document.getElementById('cfgToggle');
+const cfgRow = document.getElementById('cfgRow');
+const cfgSaved = document.getElementById('cfgSaved');
+
+let savedBase = 'https://api.litmark.co.uk';
+try { savedBase = localStorage.getItem('litmark_api_base') || savedBase; } catch {}
+apiBaseEl.value = savedBase;
+
+cfgToggle.addEventListener('click', ()=>{
+  cfgRow.style.display = cfgRow.style.display === 'none' ? 'inline' : 'none';
+});
+apiBaseEl.addEventListener('change', ()=>{
+  try { localStorage.setItem('litmark_api_base', apiBaseEl.value.trim()); } catch {}
+  cfgSaved.textContent = 'saved';
+  setTimeout(()=> cfgSaved.textContent = '', 1500);
+});
+
+document.querySelectorAll('.examples button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    const i = +b.dataset.ex;
+    qEl.value = examples[i];
+    runSearch(exKeys[i]);
+  });
+});
+
+qEl.addEventListener('input', ()=>{ qEl.style.height='auto'; qEl.style.height=qEl.scrollHeight+'px'; });
+
+goBtn.addEventListener('click', ()=> runSearch());
+
+qEl.addEventListener('keydown', e=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); goBtn.click(); }
+});
+
+async function runSearch(){
+  const question = qEl.value.trim();
+  if(!question){ qEl.focus(); return; }
+  goBtn.disabled = true;
+  emptyEl.style.display = 'none';
+  resultsEl.innerHTML = '';
+  statusEl.classList.add('searching');
+  statusEl.textContent = 'Searching OpenAlex and Semantic Scholar for open-access papers…';
+
+  const base = (apiBaseEl.value || '').trim().replace(/\/$/,'');
+  let live = null;
+  if(base){
+    try{
+      const ctrl = new AbortController();
+      const t = setTimeout(()=>ctrl.abort(), 25000);
+      const res = await fetch(`${base}/api/search?q=${encodeURIComponent(question)}`, {signal: ctrl.signal});
+      clearTimeout(t);
+      if(res.ok){
+        const data = await res.json();
+        live = data.results || [];
+      }
+    }catch(e){ live = null; }
+  }
+
+  statusEl.classList.remove('searching');
+  goBtn.disabled = false;
+
+  if(live && live.length){
+    statusEl.textContent = `${live.length} open-access papers found, ranked by relevance.`;
+    render(live.map(normalizeReal));
+  } else {
+    const val = question.toLowerCase();
+    let key = 'default';
+    if(val.includes('social') || val.includes('anxiety') || val.includes('screen')) key='anxiety';
+    else if(val.includes('crispr') || val.includes('gene') || val.includes('edit')) key='crispr';
+    const data = DATASETS[key] || DATASETS.default;
+    statusEl.textContent = live === null
+      ? `Couldn't reach a backend at "${base || '(none set)'}" — showing demo data. See ⚙ backend, and the README to run the real server.`
+      : `No open-access papers found — showing demo data instead.`;
+    render(data.map(normalizeMock));
+  }
+}
+
+function normalizeReal(p){
+  let before = p.abstract || '', mark = '', after = '';
+  if(p.highlight && p.abstract && p.abstract.includes(p.highlight)){
+    const i = p.abstract.indexOf(p.highlight);
+    before = p.abstract.slice(0, i);
+    mark = p.highlight;
+    after = p.abstract.slice(i + p.highlight.length);
+  }
+  return {
+    source: p.source, journal: p.journal, year: p.year, title: p.title,
+    authors: p.authors, score: p.score, before, mark, after,
+    why: p.reason, url: p.oaUrl
+  };
+}
+function normalizeMock(p){
+  return {
+    source: p.source, journal: p.journal, year: p.year, title: p.title,
+    authors: p.authors, score: p.score, before: p.excerpt, mark: p.mark, after: p.tail,
+    why: p.why, url: null
+  };
+}
+
+function render(data){
+  resultsEl.innerHTML = data.map((p)=>`
+    <li class="paper">
+      <div class="meta-row">
+        <span class="source-tag">${p.source}</span>
+        <span class="dot"></span>
+        <span>${p.journal}${p.year ? ', ' + p.year : ''}</span>
+        <div class="relevance">
+          <div class="meter"><i style="width:${p.score}%"></i></div>
+          <span class="num">${p.score}%</span>
+        </div>
+      </div>
+      <h3>${p.url ? `<a href="${p.url}" target="_blank" rel="noopener" style="color:inherit; text-decoration:none;">${p.title}</a>` : p.title}</h3>
+      <div class="authors">${p.authors || 'Authors unavailable'}</div>
+      <div class="excerpt">${p.before}${p.mark ? `<mark>${p.mark}</mark>` : ''}${p.after}</div>
+      <div class="why">${p.why || ''}</div>
+    </li>
+  `).join('');
+
+  resultsEl.querySelectorAll('h3').forEach(h=>{
+    h.addEventListener('click', ()=>{
+      h.closest('.paper').classList.toggle('open');
+    });
+  });
+}
+</script>
+</body>
+</html>
