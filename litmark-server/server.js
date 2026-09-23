@@ -24,8 +24,11 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "");
-const resend = new Resend(process.env.RESEND_API_KEY || "");
+// A placeholder key lets the server boot even before Stripe/Resend are
+// configured — actual billing calls will fail loudly with a clear error
+// (not a server crash) until real keys are set.
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_not_configured_yet");
+const resend = new Resend(process.env.RESEND_API_KEY || "re_not_configured_yet");
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
 const MODEL = "claude-sonnet-5";
