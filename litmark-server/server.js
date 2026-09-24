@@ -1,11 +1,13 @@
 // LitMark backend
 // Search: queries open-access literature (OpenAlex + Semantic Scholar +
-// PubMed Central), filters to genuinely open-access papers, requires the
-// actual search terms to appear in the abstract (not just loose topical
-// relevance from the search engines' own ranking), then asks Claude to
-// point at the single most relevant sentence in each abstract and
-// highlight it — no relevance score, no AI verdict on quality; the reader
-// judges that.
+// Europe PMC, which covers PMC/PubMed plus preprints), filters to
+// genuinely open-access papers, requires the actual search terms to
+// appear in the abstract (not just loose topical relevance from the
+// search engines' own ranking), then asks Claude to point at the single
+// most relevant sentence in each abstract and highlight it — no relevance
+// score, no AI verdict on quality; the reader judges that. Highlighting
+// runs in parallel chunks rather than one big sequential call, since
+// that's the dominant cost in how long a search takes.
 // Critical Analysis runs two deliberately-framed searches (one aimed at
 // supporting evidence, one at challenging evidence) and sorts each paper
 // into a column by which search found it, not by an after-the-fact
@@ -39,7 +41,11 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_not_configur
 const resend = new Resend(process.env.RESEND_API_KEY || "re_not_configured_yet");
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
-const MODEL = "claude-sonnet-5";
+// Haiku for the bulk/structured work here — extracting a quote and a short
+// line of context from an abstract doesn't need Sonnet-level reasoning,
+// and Haiku is meaningfully faster, which matters directly for how long
+// a search takes.
+const MODEL = "claude-haiku-4-5-20251001";
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const APP_URL = (process.env.APP_URL || "http://localhost:3787").replace(/\/$/, "");
 const PRICE_ID = process.env.STRIPE_PRICE_ID || "";
@@ -94,17 +100,21 @@ async function searchOpenAlex(query) {
   if (!res.ok) throw new Error(`OpenAlex ${res.status}`);
   const data = await res.json();
 
-  return data.results.map(w => ({
-    source: "OpenAlex",
-    id: w.id,
-    title: w.title,
-    year: w.publication_year,
-    journal: w.primary_location?.source?.display_name || "Unknown venue",
-    authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
-    oaUrl: w.open_access?.oa_url || w.primary_location?.pdf_url || null,
-    doi: w.doi,
-    abstract: reconstructAbstract(w.abstract_inverted_index)
-  })).filter(p => p.abstract && p.oaUrl);
+  return data.results.map(w => {
+    const oaLink = w.open_access?.oa_url || w.primary_location?.pdf_url
+      || (w.open_access?.is_oa && w.doi ? w.doi : null); // is_oa but no direct link on file — DOI landing page as a fallback rather than dropping it
+    return {
+      source: "OpenAlex",
+      id: w.id,
+      title: w.title,
+      year: w.publication_year,
+      journal: w.primary_location?.source?.display_name || "Unknown venue",
+      authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
+      oaUrl: oaLink,
+      doi: w.doi,
+      abstract: reconstructAbstract(w.abstract_inverted_index)
+    };
+  }).filter(p => p.abstract && p.oaUrl);
 }
 
 function reconstructAbstract(inverted) {
@@ -147,95 +157,40 @@ async function searchSemanticScholar(query) {
     }));
 }
 
-// ---------- Source 3: PubMed Central (PMC) ----------
-// PMC is the free full-text repository behind PubMed — everything indexed
-// there already has open, readable full text, so unlike OpenAlex/Semantic
-// Scholar there's no separate "is this actually open access" check needed.
-// Uses NCBI's E-utilities. Unlike the two JSON APIs above, this one only
-// speaks old-style XML, which is parsed here with targeted regexes rather
-// than a full XML parser — simpler to write, but more fragile against
-// unusual records than a real parser would be. Flag anything that looks
-// wrong in the logs if you see it.
-const NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/";
-const NCBI_KEY = process.env.NCBI_API_KEY || ""; // optional, raises the rate limit from 3/sec to 10/sec
+// ---------- Source 3: Europe PMC ----------
+// Covers the same PMC/PubMed open-access content as NCBI's own interface,
+// plus preprints (bioRxiv, medRxiv) — broader net, and a single clean JSON
+// call instead of NCBI's two-step XML dance. No API key needed at all.
+async function searchEuropePMC(query) {
+  const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
+  url.searchParams.set("query", `(${query}) AND (OPEN_ACCESS:Y)`);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("resultType", "core");
+  url.searchParams.set("pageSize", "20");
 
-async function searchPubMedCentral(query) {
-  const esearchUrl = new URL(NCBI_BASE + "esearch.fcgi");
-  esearchUrl.searchParams.set("db", "pmc");
-  esearchUrl.searchParams.set("term", query);
-  esearchUrl.searchParams.set("retmax", "20");
-  esearchUrl.searchParams.set("retmode", "json");
-  if (NCBI_KEY) esearchUrl.searchParams.set("api_key", NCBI_KEY);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Europe PMC ${res.status}`);
+  const data = await res.json();
+  const results = data.resultList?.result || [];
 
-  const esearchRes = await fetch(esearchUrl);
-  if (!esearchRes.ok) throw new Error(`PMC esearch ${esearchRes.status}`);
-  const esearchData = await esearchRes.json();
-  const ids = esearchData.esearchresult?.idlist || [];
-  if (ids.length === 0) return [];
-
-  const efetchUrl = new URL(NCBI_BASE + "efetch.fcgi");
-  efetchUrl.searchParams.set("db", "pmc");
-  efetchUrl.searchParams.set("id", ids.join(","));
-  efetchUrl.searchParams.set("retmode", "xml");
-  if (NCBI_KEY) efetchUrl.searchParams.set("api_key", NCBI_KEY);
-
-  const efetchRes = await fetch(efetchUrl);
-  if (!efetchRes.ok) throw new Error(`PMC efetch ${efetchRes.status}`);
-  const xml = await efetchRes.text();
-
-  return parsePmcArticles(xml, ids);
-}
-
-function xmlTag(block, tag) {
-  const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
-  return m ? m[1] : null;
-}
-function stripXmlTags(s) {
-  if (!s) return null;
-  return s
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function parsePmcArticles(xml, fallbackIds) {
-  const blocks = xml.match(/<article[\s>][\s\S]*?<\/article>/g) || [];
-
-  return blocks.map((block, i) => {
-    const title = stripXmlTags(xmlTag(block, "article-title"));
-    const abstractRaw = xmlTag(block, "abstract");
-    const abstract = abstractRaw ? stripXmlTags(abstractRaw) : null;
-
-    const yearMatch = block.match(/<pub-date[^>]*>[\s\S]*?<year>(\d{4})<\/year>/);
-    const year = yearMatch ? parseInt(yearMatch[1]) : null;
-
-    const journal = stripXmlTags(xmlTag(block, "journal-title"));
-
-    const authorMatches = [...block.matchAll(
-      /<contrib[^>]*contrib-type="author"[^>]*>[\s\S]*?<surname>(.*?)<\/surname>[\s\S]*?<given-names>(.*?)<\/given-names>/g
-    )];
-    const authors = authorMatches.slice(0, 4).map(m => `${m[2]} ${m[1]}`).join(", ");
-
-    const pmcidMatch = block.match(/<article-id pub-id-type="pmc(?:id)?"[^>]*>(?:PMC)?(\d+)<\/article-id>/i);
-    const pmcid = "PMC" + (pmcidMatch ? pmcidMatch[1] : fallbackIds[i] || "");
-
-    const doiMatch = block.match(/<article-id pub-id-type="doi"[^>]*>(.*?)<\/article-id>/i);
-    const doi = doiMatch ? doiMatch[1] : null;
+  return results.map(r => {
+    const oaLink =
+      (r.fullTextUrlList?.fullTextUrl || []).find(u => (u.availability || "").toLowerCase().includes("open access"))?.url
+      || (r.pmcid ? `https://pmc.ncbi.nlm.nih.gov/articles/${r.pmcid}/` : null)
+      || (r.doi ? `https://doi.org/${r.doi}` : null);
 
     return {
-      source: "PubMed Central",
-      id: pmcid,
-      title: title || "Untitled",
-      year,
-      journal: journal || "Unknown venue",
-      authors,
-      oaUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
-      doi,
-      abstract
+      source: "Europe PMC",
+      id: r.id,
+      title: r.title,
+      year: r.pubYear ? parseInt(r.pubYear) : null,
+      journal: r.journalTitle || "Unknown venue",
+      authors: (r.authorString || "").split(", ").slice(0, 4).join(", "),
+      oaUrl: oaLink,
+      doi: r.doi || null,
+      abstract: r.abstractText || null
     };
-  }).filter(p => p.abstract && p.abstract.length > 40);
+  }).filter(p => p.abstract && p.oaUrl);
 }
 
 // ---------- Hard relevance gate: the search term must actually appear ----------
@@ -278,7 +233,24 @@ function dedupe(papers) {
 // this just points them at the right sentence. Papers can optionally carry
 // an `angle` ('support' or 'challenge') so the highlight leans toward
 // evidence for or against, when used for Critical Analysis.
+//
+// Large candidate pools are split into chunks that run in PARALLEL rather
+// than one big sequential generation — wall-clock time then tracks the
+// size of one chunk, not the size of the whole pool, which is the single
+// biggest lever on how long a search actually takes.
+const HIGHLIGHT_CHUNK_SIZE = 12;
+
 async function highlightPapers(question, papers) {
+  if (papers.length === 0) return [];
+  const chunks = [];
+  for (let i = 0; i < papers.length; i += HIGHLIGHT_CHUNK_SIZE) {
+    chunks.push(papers.slice(i, i + HIGHLIGHT_CHUNK_SIZE));
+  }
+  const chunkResults = await Promise.all(chunks.map(chunk => highlightChunk(question, chunk)));
+  return chunkResults.flat();
+}
+
+async function highlightChunk(question, papers) {
   const numbered = papers.map((p, i) =>
     `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`
   ).join("\n\n");
@@ -300,7 +272,7 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
 
   const msg = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 8000,
+    max_tokens: 3000,
     messages: [{ role: "user", content: prompt }]
   });
 
@@ -310,7 +282,7 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
   try {
     parsed = JSON.parse(clean);
   } catch (err) {
-    console.error(`highlightPapers: JSON parse failed for ${papers.length} papers (stop_reason: ${msg.stop_reason}). First/last 300 chars:`, clean.slice(0, 300), "...", clean.slice(-300));
+    console.error(`highlightChunk: JSON parse failed for ${papers.length} papers (stop_reason: ${msg.stop_reason}). First/last 300 chars:`, clean.slice(0, 300), "...", clean.slice(-300));
     parsed = [];
   }
 
@@ -510,10 +482,10 @@ app.get("/api/search", requireAuth, async (req, res) => {
       searchSemanticScholar(searchQuery),
       searchOpenAlex(question),
       searchSemanticScholar(question),
-      searchPubMedCentral(searchQuery),
-      searchPubMedCentral(question)
+      searchEuropePMC(searchQuery),
+      searchEuropePMC(question)
     ]);
-    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "PMC(query)", "PMC(raw)"];
+    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)"];
     fetches.forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
@@ -555,10 +527,10 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
     ]);
 
     const [supportFetches, counterFetches] = await Promise.all([
-      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchPubMedCentral(supportQuery)]),
-      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchPubMedCentral(counterQuery)])
+      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchEuropePMC(supportQuery)]),
+      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchEuropePMC(counterQuery)])
     ]);
-    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "PMC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "PMC(counter)"];
+    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)"];
     [...supportFetches, ...counterFetches].forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
