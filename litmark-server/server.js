@@ -300,7 +300,7 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
 
   const msg = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 3200,
+    max_tokens: 8000,
     messages: [{ role: "user", content: prompt }]
   });
 
@@ -309,7 +309,8 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
   let parsed;
   try {
     parsed = JSON.parse(clean);
-  } catch {
+  } catch (err) {
+    console.error(`highlightPapers: JSON parse failed for ${papers.length} papers (stop_reason: ${msg.stop_reason}). First/last 300 chars:`, clean.slice(0, 300), "...", clean.slice(-300));
     parsed = [];
   }
 
@@ -526,7 +527,9 @@ app.get("/api/search", requireAuth, async (req, res) => {
       return res.json({ results: [], warning: "No open-access papers found for this query." });
     }
 
-    const results = (await highlightPapers(question, papers)).slice(0, 15);
+    const highlighted = await highlightPapers(question, papers);
+    console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
+    const results = highlighted.slice(0, 15);
 
     res.json({ results, searchQuery });
   } catch (err) {
@@ -577,6 +580,7 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
     }
 
     const highlighted = await highlightPapers(question, papers);
+    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
     const supports = highlighted.filter(p => p.angle === "support").slice(0, 7);
     const challenges = highlighted.filter(p => p.angle === "challenge").slice(0, 7);
 
