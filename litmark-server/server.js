@@ -85,10 +85,12 @@ Write a concise academic database search query (4-8 keywords/phrases, literal ke
 }
 
 // ---------- Source 1: OpenAlex ----------
-async function searchOpenAlex(query) {
+async function searchOpenAlex(query, { requireOA = true } = {}) {
   const url = new URL("https://api.openalex.org/works");
   url.searchParams.set("search", query);
-  url.searchParams.set("filter", "open_access.is_oa:true,has_abstract:true");
+  const filters = ["has_abstract:true"];
+  if (requireOA) filters.push("open_access.is_oa:true");
+  url.searchParams.set("filter", filters.join(","));
   url.searchParams.set("per-page", "20");
   url.searchParams.set("select", [
     "id", "title", "publication_year", "authorships",
@@ -111,10 +113,11 @@ async function searchOpenAlex(query) {
       journal: w.primary_location?.source?.display_name || "Unknown venue",
       authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
       oaUrl: oaLink,
+      isOA: !!w.open_access?.is_oa,
       doi: w.doi,
       abstract: reconstructAbstract(w.abstract_inverted_index)
     };
-  }).filter(p => p.abstract && p.oaUrl);
+  }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
 
 function reconstructAbstract(inverted) {
@@ -128,7 +131,7 @@ function reconstructAbstract(inverted) {
 }
 
 // ---------- Source 2: Semantic Scholar ----------
-async function searchSemanticScholar(query) {
+async function searchSemanticScholar(query, { requireOA = true } = {}) {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
   url.searchParams.set("limit", "20");
@@ -143,7 +146,7 @@ async function searchSemanticScholar(query) {
   const data = await res.json();
 
   return (data.data || [])
-    .filter(p => p.openAccessPdf?.url && p.abstract)
+    .filter(p => p.abstract && (requireOA ? p.openAccessPdf?.url : true))
     .map(p => ({
       source: "Semantic Scholar",
       id: p.externalIds?.DOI || p.paperId,
@@ -151,7 +154,8 @@ async function searchSemanticScholar(query) {
       year: p.year,
       journal: p.venue || "Unknown venue",
       authors: (p.authors || []).slice(0, 4).map(a => a.name).join(", "),
-      oaUrl: p.openAccessPdf.url,
+      oaUrl: p.openAccessPdf?.url || null,
+      isOA: !!p.openAccessPdf?.url,
       doi: p.externalIds?.DOI,
       abstract: p.abstract
     }));
@@ -161,9 +165,9 @@ async function searchSemanticScholar(query) {
 // Covers the same PMC/PubMed open-access content as NCBI's own interface,
 // plus preprints (bioRxiv, medRxiv) — broader net, and a single clean JSON
 // call instead of NCBI's two-step XML dance. No API key needed at all.
-async function searchEuropePMC(query) {
+async function searchEuropePMC(query, { requireOA = true } = {}) {
   const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
-  url.searchParams.set("query", `(${query}) AND (OPEN_ACCESS:Y)`);
+  url.searchParams.set("query", requireOA ? `(${query}) AND (OPEN_ACCESS:Y)` : query);
   url.searchParams.set("format", "json");
   url.searchParams.set("resultType", "core");
   url.searchParams.set("pageSize", "20");
@@ -187,10 +191,11 @@ async function searchEuropePMC(query) {
       journal: r.journalTitle || "Unknown venue",
       authors: (r.authorString || "").split(", ").slice(0, 4).join(", "),
       oaUrl: oaLink,
+      isOA: r.isOpenAccess === "Y",
       doi: r.doi || null,
       abstract: r.abstractText || null
     };
-  }).filter(p => p.abstract && p.oaUrl);
+  }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
 
 // ---------- Hard relevance gate: the search term must actually appear ----------
@@ -560,6 +565,192 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Critical analysis failed", detail: err.message });
+  }
+});
+
+// ---------- Essay Citation Auditor ----------
+// The student pastes a finished essay. Claude extracts every in-text
+// citation and the specific claim it's attached to. For each one, we
+// independently look up the ACTUAL paper — not trusting the student's
+// citation — and check whether the real abstract genuinely supports what
+// the essay claims. This catches fabricated or misrepresented citations
+// (increasingly common when a draft has passed through an AI writing
+// tool elsewhere) before submission, not after.
+
+async function extractCitations(essayText) {
+  const prompt = `Below is a student's essay. Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears at the end, use it to identify the full title, first author, and year for each citation.
+
+For each citation found, provide your best guess at the paper's title, first author's last name, and year — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it.
+
+Essay:
+"""
+${essayText}
+"""
+
+Respond with ONLY a JSON array, nothing else, in this shape:
+[{"claim": "exact claim sentence from the essay", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020}]
+
+Cap at 20 citations — if there are more, include the first 20 encountered.`;
+
+  const msg = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 3000,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "[]";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(clean).slice(0, 20);
+  } catch (err) {
+    console.error("extractCitations: JSON parse failed:", clean.slice(0, 300));
+    return [];
+  }
+}
+
+// Look up ONE specific paper by title/author/year (different from topic
+// search — this is trying to find the exact source the student cited).
+// Deliberately does NOT require open access: abstracts are public even
+// for paywalled papers, and we're verifying a claim against the abstract,
+// not asking the student to read the full paper.
+async function lookupPaper({ guessTitle, guessAuthor, guessYear }) {
+  const query = [guessTitle, guessAuthor, guessYear].filter(Boolean).join(" ").trim();
+  if (!query) return null;
+
+  const results = await Promise.allSettled([
+    searchOpenAlex(query, { requireOA: false }),
+    searchSemanticScholar(query, { requireOA: false }),
+    searchEuropePMC(query, { requireOA: false })
+  ]);
+  const candidates = dedupe(results.flatMap(r => r.status === "fulfilled" ? r.value : []));
+  if (candidates.length === 0) return null;
+
+  if (guessYear) {
+    const yearMatch = candidates.find(c => c.year === guessYear);
+    if (yearMatch) return yearMatch;
+  }
+  return candidates[0];
+}
+
+async function verifyCitation(claim, paper) {
+  if (!paper || !paper.abstract) {
+    // Genuinely couldn't locate this source at all — an existence problem,
+    // distinct from finding it and being unable to confirm the claim.
+    return { status: "not_found", explanation: "Couldn't find this source at all — it may not be indexed, or the title/author guess was off. Worth double-checking it actually exists." };
+  }
+  const prompt = `An essay makes this claim, attributing it to a source:
+CLAIM: "${claim}"
+
+Here is that source's actual abstract:
+"${paper.abstract}"
+
+Does the abstract genuinely support the claim as written? Respond with ONLY JSON, nothing else:
+{"status": "faithful" | "overstated" | "misrepresented" | "unrelated", "explanation": "one short plain sentence"}
+- faithful: the claim accurately reflects what the abstract says
+- overstated: the claim goes further than the evidence supports (e.g. abstract says "may suggest", claim says "proves")
+- misrepresented: the claim says something the abstract doesn't support or actually contradicts
+- unrelated: the abstract doesn't address the claim's topic at all`;
+
+  const msg = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 200,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  try {
+    const parsed = JSON.parse(clean);
+    return { status: parsed.status || "unverifiable", explanation: parsed.explanation || "" };
+  } catch {
+    // Found the real source (we have its abstract) but something went
+    // wrong generating a fidelity verdict this time — a technical hiccup,
+    // not an existence problem, so this stays a separate status.
+    return { status: "unverifiable", explanation: "Found the source, but couldn't generate a clear verdict this time — worth checking manually." };
+  }
+}
+
+// Process citations in small concurrent batches rather than all at once —
+// each citation involves 3 source lookups plus a verification call, so
+// firing 20 of these simultaneously would hammer external rate limits.
+async function mapWithConcurrency(items, limit, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const batch = items.slice(i, i + limit);
+    out.push(...(await Promise.all(batch.map(fn))));
+  }
+  return out;
+}
+
+// Rides entirely on data already fetched while verifying citations — no
+// extra API calls. Flags patterns worth a student's attention: a
+// bibliography that's gone stale, or leaning heavily on one author's work.
+function analyzeBibliography(results) {
+  const found = results.filter(r => r.matchedYear);
+  if (found.length < 3) return null; // not enough matched sources to say anything meaningful
+
+  const currentYear = new Date().getFullYear();
+  const ages = found.map(r => currentYear - r.matchedYear);
+  const avgAge = Math.round(ages.reduce((a, b) => a + b, 0) / ages.length);
+  const recentCount = ages.filter(a => a <= 5).length;
+  const oldShare = ages.filter(a => a > 10).length / found.length;
+
+  const authorCounts = {};
+  found.forEach(r => {
+    const firstAuthor = (r.matchedAuthors || "").split(",")[0]?.trim();
+    if (firstAuthor) authorCounts[firstAuthor] = (authorCounts[firstAuthor] || 0) + 1;
+  });
+  const topAuthor = Object.entries(authorCounts).sort((a, b) => b[1] - a[1])[0];
+
+  const notes = [];
+  if (recentCount === 0) {
+    notes.push(`None of your matched sources are from the last 5 years (average age: ${avgAge} years) — worth checking for more recent literature.`);
+  } else if (oldShare > 0.5) {
+    notes.push(`Over half your matched sources are more than 10 years old (average age: ${avgAge} years) — consider balancing with more recent work.`);
+  }
+  if (topAuthor && found.length >= 4) {
+    const pct = Math.round((topAuthor[1] / found.length) * 100);
+    if (pct >= 40) {
+      notes.push(`${pct}% of your matched sources share ${topAuthor[0]} as an author — worth drawing from a wider range of researchers.`);
+    }
+  }
+
+  return { matchedCount: found.length, avgAge, notes };
+}
+
+app.post("/api/audit-essay", requireAuth, async (req, res) => {
+  const essayText = (req.body.essay || "").toString().trim();
+  if (!essayText) return res.status(400).json({ error: "Missing essay text" });
+  if (essayText.length > 20000) return res.status(400).json({ error: "Essay too long — 20,000 characters max" });
+
+  try {
+    const citations = await extractCitations(essayText);
+    console.log(`[audit] extracted ${citations.length} citations`);
+
+    if (citations.length === 0) {
+      return res.json({ results: [], warning: "No in-text citations were found in this text." });
+    }
+
+    const results = await mapWithConcurrency(citations, 5, async (c) => {
+      const paper = await lookupPaper(c).catch(() => null);
+      const verdict = await verifyCitation(c.claim, paper);
+      return {
+        claim: c.claim,
+        citationText: c.citationText,
+        matchedTitle: paper?.title || null,
+        matchedUrl: paper?.oaUrl || null,
+        matchedJournal: paper?.journal || null,
+        matchedYear: paper?.year || null,
+        matchedAuthors: paper?.authors || null,
+        matchedOA: paper ? !!paper.isOA : null,
+        ...verdict
+      };
+    });
+
+    console.log(`[audit] verified ${results.length} citations`);
+    const bibliography = analyzeBibliography(results);
+    res.json({ results, bibliography });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Citation audit failed", detail: err.message });
   }
 });
 
