@@ -1,7 +1,15 @@
 // LitMark backend
-// Search: queries open-access literature (OpenAlex + Semantic Scholar),
-// filters to genuinely open-access papers, then asks Claude to score
-// relevance and pull the exact supporting sentence for highlighting.
+// Search: queries open-access literature (OpenAlex + Semantic Scholar +
+// PubMed Central), filters to genuinely open-access papers, requires the
+// actual search terms to appear in the abstract (not just loose topical
+// relevance from the search engines' own ranking), then asks Claude to
+// point at the single most relevant sentence in each abstract and
+// highlight it — no relevance score, no AI verdict on quality; the reader
+// judges that.
+// Critical Analysis runs two deliberately-framed searches (one aimed at
+// supporting evidence, one at challenging evidence) and sorts each paper
+// into a column by which search found it, not by an after-the-fact
+// AI judgment call.
 // Billing: Stripe handles all payment/card data — this server never sees
 // a card number. Auth is passwordless: a signed link is emailed, clicking
 // it proves the person controls that email address. On every search, we
@@ -75,7 +83,7 @@ async function searchOpenAlex(query) {
   const url = new URL("https://api.openalex.org/works");
   url.searchParams.set("search", query);
   url.searchParams.set("filter", "open_access.is_oa:true,has_abstract:true");
-  url.searchParams.set("per-page", "15");
+  url.searchParams.set("per-page", "20");
   url.searchParams.set("select", [
     "id", "title", "publication_year", "authorships",
     "primary_location", "open_access", "abstract_inverted_index", "doi"
@@ -113,7 +121,7 @@ function reconstructAbstract(inverted) {
 async function searchSemanticScholar(query) {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
-  url.searchParams.set("limit", "15");
+  url.searchParams.set("limit", "20");
   url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds");
 
   const headers = process.env.SEMANTIC_SCHOLAR_API_KEY
@@ -139,6 +147,120 @@ async function searchSemanticScholar(query) {
     }));
 }
 
+// ---------- Source 3: PubMed Central (PMC) ----------
+// PMC is the free full-text repository behind PubMed — everything indexed
+// there already has open, readable full text, so unlike OpenAlex/Semantic
+// Scholar there's no separate "is this actually open access" check needed.
+// Uses NCBI's E-utilities. Unlike the two JSON APIs above, this one only
+// speaks old-style XML, which is parsed here with targeted regexes rather
+// than a full XML parser — simpler to write, but more fragile against
+// unusual records than a real parser would be. Flag anything that looks
+// wrong in the logs if you see it.
+const NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/";
+const NCBI_KEY = process.env.NCBI_API_KEY || ""; // optional, raises the rate limit from 3/sec to 10/sec
+
+async function searchPubMedCentral(query) {
+  const esearchUrl = new URL(NCBI_BASE + "esearch.fcgi");
+  esearchUrl.searchParams.set("db", "pmc");
+  esearchUrl.searchParams.set("term", query);
+  esearchUrl.searchParams.set("retmax", "20");
+  esearchUrl.searchParams.set("retmode", "json");
+  if (NCBI_KEY) esearchUrl.searchParams.set("api_key", NCBI_KEY);
+
+  const esearchRes = await fetch(esearchUrl);
+  if (!esearchRes.ok) throw new Error(`PMC esearch ${esearchRes.status}`);
+  const esearchData = await esearchRes.json();
+  const ids = esearchData.esearchresult?.idlist || [];
+  if (ids.length === 0) return [];
+
+  const efetchUrl = new URL(NCBI_BASE + "efetch.fcgi");
+  efetchUrl.searchParams.set("db", "pmc");
+  efetchUrl.searchParams.set("id", ids.join(","));
+  efetchUrl.searchParams.set("retmode", "xml");
+  if (NCBI_KEY) efetchUrl.searchParams.set("api_key", NCBI_KEY);
+
+  const efetchRes = await fetch(efetchUrl);
+  if (!efetchRes.ok) throw new Error(`PMC efetch ${efetchRes.status}`);
+  const xml = await efetchRes.text();
+
+  return parsePmcArticles(xml, ids);
+}
+
+function xmlTag(block, tag) {
+  const m = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  return m ? m[1] : null;
+}
+function stripXmlTags(s) {
+  if (!s) return null;
+  return s
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parsePmcArticles(xml, fallbackIds) {
+  const blocks = xml.match(/<article[\s>][\s\S]*?<\/article>/g) || [];
+
+  return blocks.map((block, i) => {
+    const title = stripXmlTags(xmlTag(block, "article-title"));
+    const abstractRaw = xmlTag(block, "abstract");
+    const abstract = abstractRaw ? stripXmlTags(abstractRaw) : null;
+
+    const yearMatch = block.match(/<pub-date[^>]*>[\s\S]*?<year>(\d{4})<\/year>/);
+    const year = yearMatch ? parseInt(yearMatch[1]) : null;
+
+    const journal = stripXmlTags(xmlTag(block, "journal-title"));
+
+    const authorMatches = [...block.matchAll(
+      /<contrib[^>]*contrib-type="author"[^>]*>[\s\S]*?<surname>(.*?)<\/surname>[\s\S]*?<given-names>(.*?)<\/given-names>/g
+    )];
+    const authors = authorMatches.slice(0, 4).map(m => `${m[2]} ${m[1]}`).join(", ");
+
+    const pmcidMatch = block.match(/<article-id pub-id-type="pmc(?:id)?"[^>]*>(?:PMC)?(\d+)<\/article-id>/i);
+    const pmcid = "PMC" + (pmcidMatch ? pmcidMatch[1] : fallbackIds[i] || "");
+
+    const doiMatch = block.match(/<article-id pub-id-type="doi"[^>]*>(.*?)<\/article-id>/i);
+    const doi = doiMatch ? doiMatch[1] : null;
+
+    return {
+      source: "PubMed Central",
+      id: pmcid,
+      title: title || "Untitled",
+      year,
+      journal: journal || "Unknown venue",
+      authors,
+      oaUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
+      doi,
+      abstract
+    };
+  }).filter(p => p.abstract && p.abstract.length > 40);
+}
+
+// ---------- Hard relevance gate: the search term must actually appear ----------
+// Complementary to Claude's substance judgment — this is a cheap, literal
+// check applied BEFORE anything reaches Claude: does at least one real
+// keyword from the query actually occur in the abstract text? Filters out
+// candidates a search engine's own fuzzy ranking pulled in loosely.
+const STOPWORDS = new Set(["and","or","not","the","for","with","from","that","this","into","about","using","use","uses","of","in","on","to","a","an"]);
+function extractKeyTerms(query) {
+  return [...new Set(
+    query.toLowerCase()
+      .replace(/\bAND\b|\bOR\b|\bNOT\b/gi, " ")
+      .split(/[^a-z0-9]+/)
+      .filter(w => w.length >= 4 && !STOPWORDS.has(w))
+  )];
+}
+function requireTermMatch(papers, queries) {
+  const terms = [...new Set(queries.flatMap(extractKeyTerms))];
+  if (terms.length === 0) return papers;
+  return papers.filter(p => {
+    const text = (p.abstract || "").toLowerCase();
+    return terms.some(t => text.includes(t));
+  });
+}
+
 function dedupe(papers) {
   const seen = new Set();
   return papers.filter(p => {
@@ -149,23 +271,32 @@ function dedupe(papers) {
   });
 }
 
-async function scoreAndHighlight(question, papers) {
-  const numbered = papers.map((p, i) => `[${i}] TITLE: ${p.title}\nABSTRACT: ${p.abstract}`).join("\n\n");
+// Given a set of candidate papers, ask Claude for exactly one thing per
+// paper: the single sentence from its own abstract most relevant to the
+// question, quoted exactly, plus one short line of context — no numeric
+// score, no stance judgment. The reader decides what's actually relevant;
+// this just points them at the right sentence. Papers can optionally carry
+// an `angle` ('support' or 'challenge') so the highlight leans toward
+// evidence for or against, when used for Critical Analysis.
+async function highlightPapers(question, papers) {
+  const numbered = papers.map((p, i) =>
+    `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`
+  ).join("\n\n");
 
   const prompt = `A student is researching this question:
 "${question}"
 
-Below are candidate paper abstracts. For each one, judge how relevant it is to the question and pull out the single sentence (or clause) from ITS OWN abstract that most directly supports or bears on a hypothesis related to the question — quoted EXACTLY as it appears in the abstract text, word for word, so it can be located by string match.
+For each paper below, quote the single sentence (or clause) from ITS OWN abstract that is most relevant to this question — quoted EXACTLY as it appears, word for word, so it can be located by an exact string match. Where a paper is marked ANGLE: support, prefer a sentence that supports a hypothesis answering the question. Where marked ANGLE: challenge, prefer a sentence that challenges, contradicts, or complicates it. Where no angle is given, just quote whichever sentence is most relevant.
+
+Judge relevance by substance, not vocabulary. A paper that shares terminology with the question but is actually about a different mechanism, population, or claim is NOT relevant — do not force a highlight just because words match. If a paper doesn't genuinely engage with the substance of the question, OMIT its index from your response entirely rather than quoting a superficial or tangential sentence.
+
+Also give one short, plain sentence of context on why that sentence matters — not a verdict on relevance, just context to help the reader judge it themselves.
 
 Papers:
 ${numbered}
 
-Also judge the STANCE of the highlighted sentence toward a hypothesis that would answer the question: does it "support" a positive/expected answer, "challenge" it (a null result, a contradicting finding, an important limitation), or is it genuinely "mixed"/context-only.
-
 Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else:
-[{"index": 0, "score": 0-100, "highlight": "exact substring from that paper's abstract", "reason": "one sentence on why this paper matters for the question", "stance": "supports" | "challenges" | "mixed"}]
-
-If a paper is not meaningfully relevant, still include it with a low score (below 30) and your best-effort highlight and stance.`;
+[{"index": 0, "highlight": "exact substring from that paper's abstract", "reason": "one short sentence of context"}]`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -175,23 +306,26 @@ If a paper is not meaningfully relevant, still include it with a low score (belo
 
   const raw = msg.content.find(b => b.type === "text")?.text || "[]";
   const clean = raw.replace(/```json|```/g, "").trim();
-  let scored;
+  let parsed;
   try {
-    scored = JSON.parse(clean);
+    parsed = JSON.parse(clean);
   } catch {
-    scored = [];
+    parsed = [];
   }
 
-  return scored
-    .map(s => {
-      const paper = papers[s.index];
-      if (!paper) return null;
-      const found = paper.abstract.includes(s.highlight) ? s.highlight : null;
-      const stance = ["supports", "challenges", "mixed"].includes(s.stance) ? s.stance : "mixed";
-      return { ...paper, score: s.score, highlight: found, reason: s.reason, stance };
+  // Keep the original candidate order (OpenAlex/Semantic Scholar's own
+  // relevance ranking) rather than however the model happened to list
+  // them — the reader gets the raw search-engine ordering, not an
+  // AI re-ranking.
+  const byIndex = new Map(parsed.map(s => [s.index, s]));
+  return papers
+    .map((paper, i) => {
+      const s = byIndex.get(i);
+      if (!s) return null;
+      const found = s.highlight && paper.abstract.includes(s.highlight) ? s.highlight : null;
+      return { ...paper, highlight: found, reason: s.reason };
     })
-    .filter(Boolean)
-    .sort((a, b) => b.score - a.score);
+    .filter(Boolean);
 }
 
 // =====================================================================
@@ -365,27 +499,34 @@ app.get("/api/search", requireAuth, async (req, res) => {
   try {
     const searchQuery = await buildSearchQuery(question);
 
-    const [openAlex, semanticScholar] = await Promise.allSettled([
+    // Two nets, not one: the distilled keyword query catches precise
+    // matches, but a narrowed query can miss papers a broader phrasing
+    // would find — especially for open, exploratory questions ("uses of
+    // X") rather than a specific claim. Searching the raw question too
+    // and merging both pools substantially widens coverage.
+    const fetches = await Promise.allSettled([
       searchOpenAlex(searchQuery),
-      searchSemanticScholar(searchQuery)
+      searchSemanticScholar(searchQuery),
+      searchOpenAlex(question),
+      searchSemanticScholar(question),
+      searchPubMedCentral(searchQuery),
+      searchPubMedCentral(question)
     ]);
-    if (openAlex.status === "rejected") console.error("OpenAlex failed:", openAlex.reason?.message || openAlex.reason);
-    if (semanticScholar.status === "rejected") console.error("Semantic Scholar failed:", semanticScholar.reason?.message || semanticScholar.reason);
+    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "PMC(query)", "PMC(raw)"];
+    fetches.forEach((f, i) => {
+      if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
+    });
 
-    const papers = dedupe([
-      ...(openAlex.status === "fulfilled" ? openAlex.value : []),
-      ...(semanticScholar.status === "fulfilled" ? semanticScholar.value : [])
-    ]).slice(0, 24);
+    const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
+    const papers = requireTermMatch(allFound, [searchQuery, question]).slice(0, 36);
 
-    console.log(`[search] "${question}" -> query "${searchQuery}" -> ${papers.length} OA candidates`);
+    console.log(`[search] "${question}" -> query "${searchQuery}" -> ${allFound.length} candidates, ${papers.length} after keyword-match filter`);
 
     if (papers.length === 0) {
       return res.json({ results: [], warning: "No open-access papers found for this query." });
     }
 
-    const scored = await scoreAndHighlight(question, papers);
-    const relevant = scored.filter(p => p.score >= 35);
-    const results = (relevant.length ? relevant : scored.slice(0, 3)).slice(0, 15);
+    const results = (await highlightPapers(question, papers)).slice(0, 15);
 
     res.json({ results, searchQuery });
   } catch (err) {
@@ -394,11 +535,12 @@ app.get("/api/search", requireAuth, async (req, res) => {
   }
 });
 
-// ---------- Critical Analysis: actively sourced for/against columns ----------
-// Runs two searches — the normal one, and a second deliberately aimed at
-// counter-evidence — pools both, then splits the scored results into two
-// genuine columns rather than hoping enough opposing evidence turns up
-// in a single ordinary search.
+// ---------- Critical Analysis: for/against columns ----------
+// Runs two deliberately-framed searches — one for supporting evidence, one
+// for challenging evidence — and puts each paper in whichever column its
+// OWN search found it in. No post-hoc "does this support or challenge"
+// judgment call on Claude's part, so there's no failure mode where
+// everything gets classified as ambiguous and both columns end up empty.
 app.get("/api/critical-search", requireAuth, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
@@ -409,30 +551,34 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       buildCounterQuery(question)
     ]);
 
-    const fetches = await Promise.allSettled([
-      searchOpenAlex(supportQuery),
-      searchSemanticScholar(supportQuery),
-      searchOpenAlex(counterQuery),
-      searchSemanticScholar(counterQuery)
+    const [supportFetches, counterFetches] = await Promise.all([
+      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchPubMedCentral(supportQuery)]),
+      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchPubMedCentral(counterQuery)])
     ]);
-    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "OpenAlex(counter)", "SemanticScholar(counter)"];
-    fetches.forEach((f, i) => {
+    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "PMC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "PMC(counter)"];
+    [...supportFetches, ...counterFetches].forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
 
-    const papers = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : [])).slice(0, 30);
+    // support-first, so a paper found by both searches defaults to the
+    // "support" column rather than appearing twice or being dropped
+    const supportPapers = requireTermMatch(
+      supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : []), [supportQuery]
+    ).map(p => ({ ...p, angle: "support" }));
+    const counterPapers = requireTermMatch(
+      counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : []), [counterQuery]
+    ).map(p => ({ ...p, angle: "challenge" }));
+    const papers = dedupe([...supportPapers, ...counterPapers]).slice(0, 30);
 
-    console.log(`[critical] "${question}" -> support "${supportQuery}" / counter "${counterQuery}" -> ${papers.length} OA candidates`);
+    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length}) / counter "${counterQuery}" (${counterPapers.length}) -> ${papers.length} after dedupe`);
 
     if (papers.length === 0) {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
     }
 
-    const scored = await scoreAndHighlight(question, papers);
-    const supports = scored.filter(p => p.stance === "supports" && p.score >= 30)
-      .sort((a, b) => b.score - a.score).slice(0, 7);
-    const challenges = scored.filter(p => p.stance === "challenges" && p.score >= 30)
-      .sort((a, b) => b.score - a.score).slice(0, 7);
+    const highlighted = await highlightPapers(question, papers);
+    const supports = highlighted.filter(p => p.angle === "support").slice(0, 7);
+    const challenges = highlighted.filter(p => p.angle === "challenge").slice(0, 7);
 
     res.json({ supports, challenges, supportQuery, counterQuery });
   } catch (err) {
