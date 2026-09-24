@@ -369,11 +369,15 @@ app.get("/api/search", requireAuth, async (req, res) => {
       searchOpenAlex(searchQuery),
       searchSemanticScholar(searchQuery)
     ]);
+    if (openAlex.status === "rejected") console.error("OpenAlex failed:", openAlex.reason?.message || openAlex.reason);
+    if (semanticScholar.status === "rejected") console.error("Semantic Scholar failed:", semanticScholar.reason?.message || semanticScholar.reason);
 
     const papers = dedupe([
       ...(openAlex.status === "fulfilled" ? openAlex.value : []),
       ...(semanticScholar.status === "fulfilled" ? semanticScholar.value : [])
     ]).slice(0, 24);
+
+    console.log(`[search] "${question}" -> query "${searchQuery}" -> ${papers.length} OA candidates`);
 
     if (papers.length === 0) {
       return res.json({ results: [], warning: "No open-access papers found for this query." });
@@ -411,8 +415,14 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       searchOpenAlex(counterQuery),
       searchSemanticScholar(counterQuery)
     ]);
+    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "OpenAlex(counter)", "SemanticScholar(counter)"];
+    fetches.forEach((f, i) => {
+      if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
+    });
 
     const papers = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : [])).slice(0, 30);
+
+    console.log(`[critical] "${question}" -> support "${supportQuery}" / counter "${counterQuery}" -> ${papers.length} OA candidates`);
 
     if (papers.length === 0) {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
