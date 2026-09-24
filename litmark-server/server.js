@@ -27,7 +27,11 @@ import Anthropic from "@anthropic-ai/sdk";
 import Stripe from "stripe";
 import jwt from "jsonwebtoken";
 import { Resend } from "resend";
+import multer from "multer";
+import mammoth from "mammoth";
 import "dotenv/config";
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
 const app = express();
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
@@ -716,38 +720,81 @@ function analyzeBibliography(results) {
   return { matchedCount: found.length, avgAge, notes };
 }
 
+// Shared by both the paste route and the file-upload route — everything
+// after "we have plain essay text" is identical either way.
+async function auditEssayText(essayText) {
+  const citations = await extractCitations(essayText);
+  console.log(`[audit] extracted ${citations.length} citations`);
+
+  if (citations.length === 0) {
+    return { results: [], warning: "No in-text citations were found in this text." };
+  }
+
+  const results = await mapWithConcurrency(citations, 5, async (c) => {
+    const paper = await lookupPaper(c).catch(() => null);
+    const verdict = await verifyCitation(c.claim, paper);
+    return {
+      claim: c.claim,
+      citationText: c.citationText,
+      matchedTitle: paper?.title || null,
+      matchedUrl: paper?.oaUrl || null,
+      matchedJournal: paper?.journal || null,
+      matchedYear: paper?.year || null,
+      matchedAuthors: paper?.authors || null,
+      matchedOA: paper ? !!paper.isOA : null,
+      ...verdict
+    };
+  });
+
+  console.log(`[audit] verified ${results.length} citations`);
+  const bibliography = analyzeBibliography(results);
+  return { results, bibliography };
+}
+
 app.post("/api/audit-essay", requireAuth, async (req, res) => {
   const essayText = (req.body.essay || "").toString().trim();
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
   if (essayText.length > 20000) return res.status(400).json({ error: "Essay too long — 20,000 characters max" });
 
   try {
-    const citations = await extractCitations(essayText);
-    console.log(`[audit] extracted ${citations.length} citations`);
+    res.json(await auditEssayText(essayText));
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Citation audit failed", detail: err.message });
+  }
+});
 
-    if (citations.length === 0) {
-      return res.json({ results: [], warning: "No in-text citations were found in this text." });
+// ---------- Citation Audit: file upload (.docx / .txt) ----------
+// Accepts a Word doc or plain text file instead of pasted text. Extraction
+// is the one genuinely new failure mode here — .docx is a zipped bundle of
+// XML under the hood, handled by the well-established `mammoth` library
+// rather than anything hand-rolled.
+app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const name = (req.file.originalname || "").toLowerCase();
+
+  let essayText;
+  try {
+    if (name.endsWith(".docx")) {
+      const { value } = await mammoth.extractRawText({ buffer: req.file.buffer });
+      essayText = value;
+    } else if (name.endsWith(".txt")) {
+      essayText = req.file.buffer.toString("utf-8");
+    } else {
+      return res.status(400).json({ error: "Unsupported file type — please upload a .docx or .txt file" });
     }
+  } catch (err) {
+    console.error("File extraction failed:", err.message);
+    return res.status(400).json({ error: "Couldn't read that file — it may be corrupted, password-protected, or an older .doc format (only .docx is supported)" });
+  }
 
-    const results = await mapWithConcurrency(citations, 5, async (c) => {
-      const paper = await lookupPaper(c).catch(() => null);
-      const verdict = await verifyCitation(c.claim, paper);
-      return {
-        claim: c.claim,
-        citationText: c.citationText,
-        matchedTitle: paper?.title || null,
-        matchedUrl: paper?.oaUrl || null,
-        matchedJournal: paper?.journal || null,
-        matchedYear: paper?.year || null,
-        matchedAuthors: paper?.authors || null,
-        matchedOA: paper ? !!paper.isOA : null,
-        ...verdict
-      };
-    });
+  essayText = (essayText || "").trim();
+  if (!essayText) return res.status(400).json({ error: "That file appears to be empty" });
+  if (essayText.length > 20000) return res.status(400).json({ error: "That essay is too long — 20,000 characters max" });
 
-    console.log(`[audit] verified ${results.length} citations`);
-    const bibliography = analyzeBibliography(results);
-    res.json({ results, bibliography });
+  try {
+    const result = await auditEssayText(essayText);
+    res.json({ ...result, extractedLength: essayText.length });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Citation audit failed", detail: err.message });
