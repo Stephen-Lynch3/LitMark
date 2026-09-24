@@ -215,6 +215,16 @@ async function hasActiveSubscription(customerId) {
 
 // Require a valid session token AND a currently-active subscription.
 async function requireAuth(req, res, next) {
+  // Stress-testing switch: set DISABLE_AUTH=true on Render to let every
+  // request through with no login/subscription check at all. Flip it back
+  // to unset (or "false") to restore normal gated behaviour — no code
+  // changes needed either way.
+  if (process.env.DISABLE_AUTH === "true") {
+    req.email = "test@litmark.local";
+    req.customerId = null;
+    return next();
+  }
+
   const header = req.headers.authorization || "";
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: "Not logged in" });
