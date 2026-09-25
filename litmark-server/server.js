@@ -865,30 +865,26 @@ app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (r
 });
 
 // ---------- Search Lexicon ----------
-// Not a paper search — this generates alternative search TERMS (synonyms,
-// abbreviations, acronyms, gene/protein aliases, etc.) for a student to
-// use themselves when searching PubMed directly. Categories are generated
-// dynamically per question, not a fixed template.
+// Not a paper search — this generates ONE ready-to-paste PubMed Boolean
+// query (with proper AND/OR grouping and field tags), plus a breakdown of
+// the distinct concepts it's built from, so the student understands what
+// they're pasting rather than just receiving a loose bag of words.
 async function generateLexicon(question) {
-  const prompt = `A student is preparing to search PubMed for literature on this research question:
+  const prompt = `A student wants to search PubMed for literature on this research question:
 "${question}"
 
-Generate a useful search lexicon: alternative search terms they should also try, organized into a small number of clearly-named categories that make sense for THIS specific question (invent category names that actually fit the topic — don't force a fixed template).
+Build ONE single, ready-to-paste PubMed search query using proper Boolean search syntax:
+- Group synonymous or alternative terms for the SAME concept together with OR, inside parentheses
+- Combine DISTINCT concepts with AND
+- Put quotation marks around multi-word phrases
+- Where it genuinely helps precision, add PubMed field tags like [tiab] (title/abstract) — don't overuse them
+- Include, where genuinely useful for this specific question: synonyms, alternative spellings, abbreviations/acronyms, singular/plural variants, gene/protein aliases, and closely related biological terminology (e.g. ortholog/orthologue) — only when it actually fits
+- Do NOT blindly treat merely related concepts as synonyms — only group terms that are genuinely interchangeable for search purposes
 
-Include, where genuinely useful for this specific question:
-- synonyms
-- alternative spellings
-- abbreviations and acronyms
-- singular/plural variants
-- common terminology variations
-- gene/protein aliases
-- relevant experimental terminology
-- relevant biological terminology (e.g. ortholog/orthologue, homolog/homologue) — only when it actually fits
+Also break the query down into the distinct CONCEPTS it's built from (one entry per AND-joined group), so the student can see what each OR-group represents and verify nothing important was missed.
 
-Do NOT blindly treat merely related scientific concepts as synonyms — only include terms that are genuinely useful search variants or clearly, directly related search concepts for this exact question.
-
-Respond with ONLY JSON in this exact shape, nothing else:
-{"categories": [{"name": "Core terms", "terms": ["...", "..."]}, {"name": "Related terms", "terms": ["...", "..."]}]}`;
+Respond with ONLY JSON in this exact shape, nothing else — the query must be valid, directly pasteable PubMed syntax:
+{"query": "(\\"term1\\"[tiab] OR \\"term2\\"[tiab]) AND (\\"term3\\"[tiab] OR \\"term4\\"[tiab])", "concepts": [{"name": "Concept name", "terms": ["term1", "term2"]}]}`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -903,17 +899,18 @@ Respond with ONLY JSON in this exact shape, nothing else:
     parsed = JSON.parse(clean);
   } catch (err) {
     console.error("generateLexicon: JSON parse failed:", clean.slice(0, 300));
-    throw new Error("Could not generate a valid lexicon");
+    throw new Error("Could not generate a valid search query");
   }
 
-  const categories = (Array.isArray(parsed.categories) ? parsed.categories : [])
+  const query = typeof parsed.query === "string" ? parsed.query.trim() : "";
+  const concepts = (Array.isArray(parsed.concepts) ? parsed.concepts : [])
     .filter(c => c && typeof c.name === "string" && Array.isArray(c.terms))
     .map(c => ({ name: c.name, terms: c.terms.filter(t => typeof t === "string" && t.trim()).slice(0, 15) }))
     .filter(c => c.terms.length > 0)
     .slice(0, 8);
 
-  if (categories.length === 0) throw new Error("Could not generate a valid lexicon");
-  return categories;
+  if (!query) throw new Error("Could not generate a valid search query");
+  return { query, concepts };
 }
 
 app.get("/api/lexicon", requireAuth, async (req, res) => {
@@ -921,8 +918,8 @@ app.get("/api/lexicon", requireAuth, async (req, res) => {
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
 
   try {
-    const categories = await generateLexicon(question);
-    res.json({ categories });
+    const result = await generateLexicon(question);
+    res.json(result);
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Lexicon generation failed", detail: err.message });
