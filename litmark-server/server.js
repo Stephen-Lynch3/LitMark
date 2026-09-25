@@ -510,7 +510,7 @@ app.get("/api/search", requireAuth, async (req, res) => {
 
     const highlighted = await highlightPapers(question, papers);
     console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
-    const results = highlighted.slice(0, 15);
+    const results = highlighted.slice(0, 20);
 
     res.json({ results, searchQuery });
   } catch (err) {
