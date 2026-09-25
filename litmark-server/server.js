@@ -866,29 +866,33 @@ app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (r
 
 // ---------- Search Lexicon ----------
 // Not a paper search — this generates ONE ready-to-paste PubMed Boolean
-// query (with proper AND/OR grouping and field tags), plus a breakdown of
-// the distinct concepts it's built from, so the student understands what
-// they're pasting rather than just receiving a loose bag of words.
+// query, plus a breakdown of the concepts it's built from. Claude only
+// ever returns plain terms (simple, robust JSON) — the actual Boolean
+// query string, with its nested quote marks and field tags, is built
+// mechanically by this code, not generated as a single fragile JSON
+// string value (which failed on more complex questions in practice).
 async function generateLexicon(question) {
   const prompt = `A student wants to search PubMed for literature on this research question:
 "${question}"
 
-Build ONE single, ready-to-paste PubMed search query using proper Boolean search syntax:
-- Group synonymous or alternative terms for the SAME concept together with OR, inside parentheses
-- Combine DISTINCT concepts with AND
-- Put quotation marks around multi-word phrases
-- Where it genuinely helps precision, add PubMed field tags like [tiab] (title/abstract) — don't overuse them
-- Include, where genuinely useful for this specific question: synonyms, alternative spellings, abbreviations/acronyms, singular/plural variants, gene/protein aliases, and closely related biological terminology (e.g. ortholog/orthologue) — only when it actually fits
-- Do NOT blindly treat merely related concepts as synonyms — only group terms that are genuinely interchangeable for search purposes
+Break this down into the distinct CONCEPTS a good PubMed search needs (usually 2-4), and for each concept, list the alternative search terms that mean the same thing or are genuinely interchangeable for search purposes — the terms within one concept will be combined with OR, so only group things that are truly alternative ways of saying the same thing.
 
-Also break the query down into the distinct CONCEPTS it's built from (one entry per AND-joined group), so the student can see what each OR-group represents and verify nothing important was missed.
+For each concept, include, where genuinely useful for this specific question:
+- synonyms
+- alternative spellings
+- abbreviations and acronyms
+- singular/plural variants
+- gene/protein aliases
+- closely related biological terminology (e.g. ortholog/orthologue, homolog/homologue) — only when it actually fits
 
-Respond with ONLY JSON in this exact shape, nothing else — the query must be valid, directly pasteable PubMed syntax:
-{"query": "(\\"term1\\"[tiab] OR \\"term2\\"[tiab]) AND (\\"term3\\"[tiab] OR \\"term4\\"[tiab])", "concepts": [{"name": "Concept name", "terms": ["term1", "term2"]}]}`;
+Do NOT blindly treat merely related concepts as synonyms of each other — a concept's terms must be genuinely interchangeable, not just topically related.
+
+Respond with ONLY JSON in this exact shape, nothing else — plain terms only, no quote marks or search syntax inside the strings themselves:
+{"concepts": [{"name": "Concept name", "terms": ["term1", "term2", "term3"]}]}`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 1200,
+    max_tokens: 1000,
     messages: [{ role: "user", content: prompt }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "{}";
@@ -899,17 +903,33 @@ Respond with ONLY JSON in this exact shape, nothing else — the query must be v
     parsed = JSON.parse(clean);
   } catch (err) {
     console.error("generateLexicon: JSON parse failed:", clean.slice(0, 300));
-    throw new Error("Could not generate a valid search query");
+    throw new Error("Could not generate search terms");
   }
 
-  const query = typeof parsed.query === "string" ? parsed.query.trim() : "";
   const concepts = (Array.isArray(parsed.concepts) ? parsed.concepts : [])
     .filter(c => c && typeof c.name === "string" && Array.isArray(c.terms))
-    .map(c => ({ name: c.name, terms: c.terms.filter(t => typeof t === "string" && t.trim()).slice(0, 15) }))
+    .map(c => ({
+      name: c.name,
+      // Strip any stray quote marks the model might still add despite
+      // instructions — this is the string WE will wrap in quotes below.
+      terms: c.terms
+        .filter(t => typeof t === "string" && t.trim())
+        .map(t => t.replace(/["']/g, "").trim())
+        .filter(Boolean)
+        .slice(0, 12)
+    }))
     .filter(c => c.terms.length > 0)
-    .slice(0, 8);
+    .slice(0, 6);
 
-  if (!query) throw new Error("Could not generate a valid search query");
+  if (concepts.length === 0) throw new Error("Could not generate search terms");
+
+  // Build the actual Boolean query string ourselves, mechanically — no
+  // risk of malformed JSON or broken syntax, since this is plain string
+  // concatenation, not something an LLM had to get exactly right.
+  const query = concepts
+    .map(c => "(" + c.terms.map(t => t.includes(" ") ? `"${t}"[tiab]` : `${t}[tiab]`).join(" OR ") + ")")
+    .join(" AND ");
+
   return { query, concepts };
 }
 
