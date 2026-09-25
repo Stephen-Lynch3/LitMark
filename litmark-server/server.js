@@ -864,6 +864,71 @@ app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (r
   }
 });
 
+// ---------- Search Lexicon ----------
+// Not a paper search — this generates alternative search TERMS (synonyms,
+// abbreviations, acronyms, gene/protein aliases, etc.) for a student to
+// use themselves when searching PubMed directly. Categories are generated
+// dynamically per question, not a fixed template.
+async function generateLexicon(question) {
+  const prompt = `A student is preparing to search PubMed for literature on this research question:
+"${question}"
+
+Generate a useful search lexicon: alternative search terms they should also try, organized into a small number of clearly-named categories that make sense for THIS specific question (invent category names that actually fit the topic — don't force a fixed template).
+
+Include, where genuinely useful for this specific question:
+- synonyms
+- alternative spellings
+- abbreviations and acronyms
+- singular/plural variants
+- common terminology variations
+- gene/protein aliases
+- relevant experimental terminology
+- relevant biological terminology (e.g. ortholog/orthologue, homolog/homologue) — only when it actually fits
+
+Do NOT blindly treat merely related scientific concepts as synonyms — only include terms that are genuinely useful search variants or clearly, directly related search concepts for this exact question.
+
+Respond with ONLY JSON in this exact shape, nothing else:
+{"categories": [{"name": "Core terms", "terms": ["...", "..."]}, {"name": "Related terms", "terms": ["...", "..."]}]}`;
+
+  const msg = await anthropic.messages.create({
+    model: MODEL,
+    max_tokens: 1200,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch (err) {
+    console.error("generateLexicon: JSON parse failed:", clean.slice(0, 300));
+    throw new Error("Could not generate a valid lexicon");
+  }
+
+  const categories = (Array.isArray(parsed.categories) ? parsed.categories : [])
+    .filter(c => c && typeof c.name === "string" && Array.isArray(c.terms))
+    .map(c => ({ name: c.name, terms: c.terms.filter(t => typeof t === "string" && t.trim()).slice(0, 15) }))
+    .filter(c => c.terms.length > 0)
+    .slice(0, 8);
+
+  if (categories.length === 0) throw new Error("Could not generate a valid lexicon");
+  return categories;
+}
+
+app.get("/api/lexicon", requireAuth, async (req, res) => {
+  const question = (req.query.q || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing query param: q" });
+
+  try {
+    const categories = await generateLexicon(question);
+    res.json({ categories });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Lexicon generation failed", detail: err.message });
+  }
+});
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3787;
