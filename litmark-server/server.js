@@ -581,20 +581,54 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
 // (increasingly common when a draft has passed through an AI writing
 // tool elsewhere) before submission, not after.
 
+// Long essays are split into chunks and extracted in parallel — the same
+// principle as the highlighting step. A reference list (if found) is kept
+// attached to every chunk, so a citation in chunk 1 can still be matched
+// against a bibliography that's only stated once, at the very end.
+const CITATION_CHUNK_SIZE = 10000;
+const MAX_CITATIONS_TOTAL = 40;
+
+function splitIntoChunks(text, size) {
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(start + size, text.length);
+    if (end < text.length) {
+      const lastBreak = text.lastIndexOf("\n\n", end);
+      if (lastBreak > start + size * 0.5) end = lastBreak;
+    }
+    chunks.push(text.slice(start, end).trim());
+    start = end;
+  }
+  return chunks.filter(Boolean);
+}
+
 async function extractCitations(essayText) {
-  const prompt = `Below is a student's essay. Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears at the end, use it to identify the full title, first author, and year for each citation.
+  const refMatch = [...essayText.matchAll(/\n\s*(references|bibliography|works cited)\s*\n/gi)].pop();
+  const body = refMatch ? essayText.slice(0, refMatch.index) : essayText;
+  const refSection = refMatch ? essayText.slice(refMatch.index) : "";
+
+  const chunks = splitIntoChunks(body, CITATION_CHUNK_SIZE);
+  const perChunk = await Promise.all(
+    chunks.map(chunk => extractCitationsFromChunk(chunk + (refSection ? "\n\n" + refSection : "")))
+  );
+  return perChunk.flat().slice(0, MAX_CITATIONS_TOTAL);
+}
+
+async function extractCitationsFromChunk(text) {
+  const prompt = `Below is an excerpt from a student's essay (it may be a section of a longer document, with the full reference list included at the end if one exists). Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears, use it to identify the full title, first author, and year for each citation.
 
 For each citation found, provide your best guess at the paper's title, first author's last name, and year — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it.
 
-Essay:
+Text:
 """
-${essayText}
+${text}
 """
 
 Respond with ONLY a JSON array, nothing else, in this shape:
-[{"claim": "exact claim sentence from the essay", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020}]
+[{"claim": "exact claim sentence from the text", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020}]
 
-Cap at 20 citations — if there are more, include the first 20 encountered.`;
+Only extract citations that actually appear in this excerpt's own body text — ignore reference-list entries that aren't cited here.`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -604,9 +638,9 @@ Cap at 20 citations — if there are more, include the first 20 encountered.`;
   const raw = msg.content.find(b => b.type === "text")?.text || "[]";
   const clean = raw.replace(/```json|```/g, "").trim();
   try {
-    return JSON.parse(clean).slice(0, 20);
+    return JSON.parse(clean);
   } catch (err) {
-    console.error("extractCitations: JSON parse failed:", clean.slice(0, 300));
+    console.error("extractCitationsFromChunk: JSON parse failed:", clean.slice(0, 300));
     return [];
   }
 }
@@ -616,6 +650,22 @@ Cap at 20 citations — if there are more, include the first 20 encountered.`;
 // Deliberately does NOT require open access: abstracts are public even
 // for paywalled papers, and we're verifying a claim against the abstract,
 // not asking the student to read the full paper.
+
+// Crude but effective: fraction of significant words (>3 letters) shared
+// between two titles. Used to make sure we're comparing the claim against
+// the ACTUAL cited paper, not just whatever came back first from search.
+function titleSimilarity(a, b) {
+  if (!a || !b) return 0;
+  const words = s => new Set(
+    s.toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3)
+  );
+  const wa = words(a), wb = words(b);
+  if (wa.size === 0 || wb.size === 0) return 0;
+  let overlap = 0;
+  for (const w of wa) if (wb.has(w)) overlap++;
+  return overlap / Math.max(wa.size, wb.size);
+}
+
 async function lookupPaper({ guessTitle, guessAuthor, guessYear }) {
   const query = [guessTitle, guessAuthor, guessYear].filter(Boolean).join(" ").trim();
   if (!query) return null;
@@ -628,11 +678,23 @@ async function lookupPaper({ guessTitle, guessAuthor, guessYear }) {
   const candidates = dedupe(results.flatMap(r => r.status === "fulfilled" ? r.value : []));
   if (candidates.length === 0) return null;
 
-  if (guessYear) {
-    const yearMatch = candidates.find(c => c.year === guessYear);
-    if (yearMatch) return yearMatch;
+  if (!guessTitle) {
+    // No title to check against — too risky to just guess by year alone,
+    // since that could easily land on the wrong paper.
+    return guessYear ? (candidates.find(c => c.year === guessYear) || null) : null;
   }
-  return candidates[0];
+
+  let best = null, bestScore = 0;
+  for (const c of candidates) {
+    let score = titleSimilarity(guessTitle, c.title);
+    if (guessYear && c.year === guessYear) score += 0.15;
+    if (score > bestScore) { bestScore = score; best = c; }
+  }
+
+  // Require real confidence before trusting a match — falsely matching
+  // the wrong paper and reporting a correct citation as "misrepresented"
+  // is a worse failure than honestly saying we couldn't find it.
+  return bestScore >= 0.35 ? best : null;
 }
 
 async function verifyCitation(claim, paper) {
@@ -732,6 +794,7 @@ async function auditEssayText(essayText) {
 
   const results = await mapWithConcurrency(citations, 5, async (c) => {
     const paper = await lookupPaper(c).catch(() => null);
+    console.log(`[audit] guessed "${c.guessTitle || '(no title)'}" (${c.guessAuthor || '?'}, ${c.guessYear || '?'}) -> matched "${paper?.title || 'NOTHING'}"${paper?.year ? ' (' + paper.year + ')' : ''}`);
     const verdict = await verifyCitation(c.claim, paper);
     return {
       claim: c.claim,
@@ -754,7 +817,7 @@ async function auditEssayText(essayText) {
 app.post("/api/audit-essay", requireAuth, async (req, res) => {
   const essayText = (req.body.essay || "").toString().trim();
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
-  if (essayText.length > 20000) return res.status(400).json({ error: "Essay too long — 20,000 characters max" });
+  if (essayText.length > 100000) return res.status(400).json({ error: "Essay too long — 100,000 characters max (around 15,000 words)" });
 
   try {
     res.json(await auditEssayText(essayText));
@@ -790,7 +853,7 @@ app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (r
 
   essayText = (essayText || "").trim();
   if (!essayText) return res.status(400).json({ error: "That file appears to be empty" });
-  if (essayText.length > 20000) return res.status(400).json({ error: "That essay is too long — 20,000 characters max" });
+  if (essayText.length > 100000) return res.status(400).json({ error: "That essay is too long — 100,000 characters max (around 15,000 words)" });
 
   try {
     const result = await auditEssayText(essayText);
