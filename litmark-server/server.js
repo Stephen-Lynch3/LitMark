@@ -623,10 +623,19 @@ app.get("/api/search", requireAuth, async (req, res) => {
     const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)"];
     fetches.forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
+      else console.log(`${labels[i]}: ${f.value.length} results`);
     });
 
     const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
     const papers = requireTermMatch(allFound, [searchQuery, question]).slice(0, 36);
+
+    // Breaks candidate counts down by source at each stage — this is what
+    // actually shows whether a source is quietly contributing nothing,
+    // rather than just a single combined total that hides which source
+    // dropped out.
+    const bySource = (list) => list.reduce((acc, p) => { acc[p.source] = (acc[p.source] || 0) + 1; return acc; }, {});
+    console.log(`[search] candidates by source (before filter):`, bySource(allFound));
+    console.log(`[search] candidates by source (after filter):`, bySource(papers));
 
     console.log(`[search] "${question}" -> query "${searchQuery}" -> ${allFound.length} candidates, ${papers.length} after keyword-match filter`);
 
