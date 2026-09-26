@@ -317,12 +317,17 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
         .slice(0, 2)
         .map(h => ({ text: h.text, reason: typeof h.reason === "string" ? h.reason : "" }));
       if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
-      return {
-        ...paper,
-        highlights,
-        relevance: clampScore(s.relevance),
-        accuracy: clampScore(s.accuracy)
-      };
+
+      const relevance = clampScore(s.relevance);
+      const accuracy = clampScore(s.accuracy);
+      // Suitability is computed here, deterministically — not asked of the
+      // model directly — since averaging two numbers we already trust is
+      // more reliable than hoping the model self-combines them consistently.
+      const suitability = (relevance != null && accuracy != null)
+        ? Math.round((relevance + accuracy) / 2)
+        : (relevance ?? accuracy ?? null);
+
+      return { ...paper, highlights, suitability };
     })
     .filter(Boolean);
 }
@@ -549,7 +554,11 @@ app.get("/api/search", requireAuth, async (req, res) => {
 
     const highlighted = await highlightPapers(question, papers);
     console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
-    const results = highlighted.slice(0, 20);
+    // Highest suitability first. Sorting (unlike the old filtering-by-score
+    // approach) never drops a paper — it only changes order — so it doesn't
+    // carry the failure mode that got scoring removed once already.
+    const sorted = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1));
+    const results = sorted.slice(0, 20);
 
     res.json({ results, searchQuery });
   } catch (err) {
@@ -601,8 +610,9 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
 
     const highlighted = await highlightPapers(question, papers);
     console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
-    const supports = highlighted.filter(p => p.angle === "support").slice(0, 7);
-    const challenges = highlighted.filter(p => p.angle === "challenge").slice(0, 7);
+    const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
+    const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 7);
+    const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 7);
 
     res.json({ supports, challenges, supportQuery, counterQuery });
   } catch (err) {
