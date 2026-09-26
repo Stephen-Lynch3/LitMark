@@ -313,6 +313,30 @@ function dedupe(papers) {
   });
 }
 
+// A plain slice(0, N) after concatenating sources in a fixed order silently
+// starves whichever source is listed last — a source with plenty of
+// genuinely good candidates can lose almost all of them just because
+// another source's results happen to appear earlier in the array. This
+// round-robins across sources first (one from each, then a second from
+// each, and so on) so the cap applies fairly, not by array position.
+function interleaveBySource(papers) {
+  const bySource = new Map();
+  papers.forEach(p => {
+    if (!bySource.has(p.source)) bySource.set(p.source, []);
+    bySource.get(p.source).push(p);
+  });
+  const lists = [...bySource.values()];
+  const result = [];
+  for (let i = 0; result.length < papers.length; i++) {
+    let addedAny = false;
+    for (const list of lists) {
+      if (i < list.length) { result.push(list[i]); addedAny = true; }
+    }
+    if (!addedAny) break;
+  }
+  return result;
+}
+
 // Given a set of candidate papers, ask Claude for exactly one thing per
 // paper: the single sentence from its own abstract most relevant to the
 // question, quoted exactly, plus one short line of context — no numeric
@@ -637,7 +661,7 @@ app.get("/api/search", requireAuth, async (req, res) => {
     });
 
     const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
-    const papers = requireTermMatch(allFound, [searchQuery, question]).slice(0, 36);
+    const papers = interleaveBySource(requireTermMatch(allFound, [searchQuery, question])).slice(0, 36);
 
     // Breaks candidate counts down by source at each stage — this is what
     // actually shows whether a source is quietly contributing nothing,
@@ -729,7 +753,7 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
     const counterPapers = requireTermMatch(
       counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : []), [counterQuery]
     ).map(p => ({ ...p, angle: "challenge" }));
-    const papers = dedupe([...supportPapers, ...counterPapers]).slice(0, 30);
+    const papers = interleaveBySource(dedupe([...supportPapers, ...counterPapers])).slice(0, 30);
 
     console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length}) / counter "${counterQuery}" (${counterPapers.length}) -> ${papers.length} after dedupe`);
 
