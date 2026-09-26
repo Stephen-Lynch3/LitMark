@@ -202,7 +202,74 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
 
-// ---------- Hard relevance gate: the search term must actually appear ----------
+// Given ANY paper's DOI (regardless of whether OpenAlex, Semantic Scholar,
+// or Europe PMC's own topic search originally found it), check whether
+// Europe PMC separately has it indexed with full text available. This is
+// how full-text coverage extends beyond papers Europe PMC's own search
+// happened to surface — without ever touching an arbitrary publisher's
+// PDF or HTML, which is where real fragility would start.
+async function findPmcMatchByDoi(doi) {
+  if (!doi) return null;
+  const cleanDoi = doi.replace(/^https?:\/\/doi\.org\//i, "");
+  try {
+    const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
+    url.searchParams.set("query", `DOI:"${cleanDoi}"`);
+    url.searchParams.set("format", "json");
+    url.searchParams.set("pageSize", "1");
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const hit = data.resultList?.result?.[0];
+    if (!hit || !hit.pmcid) return null;
+    const hasFullText = (hit.fullTextUrlList?.fullTextUrl || [])
+      .some(u => (u.documentStyle || "").toLowerCase().includes("xml") || u.site === "Europe_PMC");
+    return hasFullText ? hit.pmcid : null;
+  } catch {
+    return null;
+  }
+}
+
+function stripXmlTags(s) {
+  if (!s) return "";
+  return s
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Fetches the JATS full-text XML for a PMC-indexed open-access article and
+// pulls out ONLY the Methods and Results sections, kept short (2000 chars
+// each) — used purely to inform which sentence Claude highlights, not
+// shown to the user wholesale. We deliberately do NOT store or re-serve a
+// paper's full body text ourselves: an open-access flag confirms it's free
+// to READ, not that every OA license permits a third party to re-host the
+// whole text (that varies — CC-BY generally allows it, CC-BY-NC-ND does
+// not). For actually reading the full paper, the safe approach is showing
+// PMC's own page in an embedded frame (see pmcUrl below), never a copy.
+async function fetchPmcFullText(pmcid) {
+  const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/${pmcid}/fullTextXML`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Europe PMC fullTextXML ${res.status}`);
+  const xml = await res.text();
+
+  const sections = [...xml.matchAll(/<sec[^>]*>[\s\S]*?<\/sec>/gi)].map(m => m[0]);
+  const findSection = (pattern) => {
+    const sec = sections.find(s => {
+      const titleMatch = s.match(/<title>(.*?)<\/title>/i);
+      return titleMatch && pattern.test(titleMatch[1]);
+    });
+    return sec ? stripXmlTags(sec).slice(0, 2000) : null;
+  };
+
+  return {
+    methodsExcerpt: findSection(/method/i),
+    resultsExcerpt: findSection(/result/i)
+  };
+}
+
+
 // Complementary to Claude's substance judgment — this is a cheap, literal
 // check applied BEFORE anything reaches Claude: does at least one real
 // keyword from the query actually occur in the abstract text? Filters out
@@ -260,14 +327,17 @@ async function highlightPapers(question, papers) {
 }
 
 async function highlightChunk(question, papers) {
-  const numbered = papers.map((p, i) =>
-    `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`
-  ).join("\n\n");
+  const numbered = papers.map((p, i) => {
+    let block = `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`;
+    if (p.methodsExcerpt) block += `\nMETHODS EXCERPT: ${p.methodsExcerpt}`;
+    if (p.resultsExcerpt) block += `\nRESULTS EXCERPT: ${p.resultsExcerpt}`;
+    return block;
+  }).join("\n\n");
 
   const prompt = `A student is researching this question:
 "${question}"
 
-For each paper below, quote the sentence(s) from ITS OWN abstract that are most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight. Only include a second (maximum two) if the abstract contains a genuinely distinct additional point relevant to the question — never pad with a weaker second quote just to have more than one. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
+For each paper below, quote the sentence(s) most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight, drawn from the ABSTRACT. Only include a second (maximum two) if there's a genuinely distinct additional point — never pad with a weaker second quote just to have more than one. Where a paper also has a METHODS EXCERPT or RESULTS EXCERPT, you may quote from one of those instead of (or in addition to) the abstract if it contains something more specifically relevant than anything in the abstract — but don't force it; most highlights should still come from the abstract, since that's where a paper's own summary of what matters usually lives. Say which section each quote came from. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
 
 Judge relevance by substance, not vocabulary. A paper that shares terminology with the question but is actually about a different mechanism, population, or claim is NOT relevant — do not force a highlight just because words match. If a paper doesn't genuinely engage with the substance of the question, OMIT its index from your response entirely rather than quoting a superficial or tangential sentence.
 
@@ -275,13 +345,13 @@ For each highlight, give one short, plain sentence of context on why it matters 
 
 Also give the paper two scores (0-100), your own honest estimate — these are shown to the reader as informational context only, never used to hide or rank results, so give your genuine judgment rather than avoiding extremes:
 - "relevance": how relevant this paper is to the student's question overall
-- "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the abstract
+- "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the paper
 
 Papers:
 ${numbered}
 
-Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else:
-[{"index": 0, "highlights": [{"text": "exact substring from that paper's abstract", "reason": "one short sentence of context"}], "relevance": 0-100, "accuracy": 0-100}]`;
+Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else — "section" must be exactly one of "abstract", "methods", or "results":
+[{"index": 0, "highlights": [{"text": "exact substring from that section", "reason": "one short sentence of context", "section": "abstract"}], "relevance": 0-100, "accuracy": 0-100}]`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -311,11 +381,22 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
       const s = byIndex.get(i);
       if (!s) return null;
       const rawHighlights = Array.isArray(s.highlights) ? s.highlights
-        : (s.highlight ? [{ text: s.highlight, reason: s.reason }] : []);
+        : (s.highlight ? [{ text: s.highlight, reason: s.reason, section: "abstract" }] : []);
+      // A highlight is only kept if its quoted text is genuinely locatable
+      // in the section it claims to be from — this is what stops a
+      // fabricated or misattributed quote from ever reaching the reader.
+      const sourceTextFor = section =>
+        section === "methods" ? paper.methodsExcerpt
+        : section === "results" ? paper.resultsExcerpt
+        : paper.abstract;
       const highlights = rawHighlights
-        .filter(h => h && typeof h.text === "string" && paper.abstract.includes(h.text))
-        .slice(0, 2)
-        .map(h => ({ text: h.text, reason: typeof h.reason === "string" ? h.reason : "" }));
+        .map(h => ({
+          text: h?.text,
+          reason: typeof h?.reason === "string" ? h.reason : "",
+          section: ["abstract", "methods", "results"].includes(h?.section) ? h.section : "abstract"
+        }))
+        .filter(h => h.text && sourceTextFor(h.section) && sourceTextFor(h.section).includes(h.text))
+        .slice(0, 2);
       if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
 
       const relevance = clampScore(s.relevance);
@@ -552,8 +633,29 @@ app.get("/api/search", requireAuth, async (req, res) => {
       return res.json({ results: [], warning: "No open-access papers found for this query." });
     }
 
-    const highlighted = await highlightPapers(question, papers);
-    console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
+    // For every candidate — regardless of which source found it — check
+    // whether Europe PMC separately has full text available. This is what
+    // lets Claude consider Methods/Results, not just the abstract, when
+    // picking a highlight. Failures here just fall back to abstract-only
+    // for that one paper; they never break the search.
+    const withFullText = await Promise.all(papers.map(async (p) => {
+      try {
+        const pmcid = await findPmcMatchByDoi(p.doi);
+        if (!pmcid) return p;
+        const ft = await fetchPmcFullText(pmcid);
+        return {
+          ...p, hasFullText: true,
+          pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
+          methodsExcerpt: ft.methodsExcerpt, resultsExcerpt: ft.resultsExcerpt
+        };
+      } catch {
+        return p;
+      }
+    }));
+    console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} candidates`);
+
+    const highlighted = await highlightPapers(question, withFullText);
+    console.log(`[search] highlightPapers: ${withFullText.length} in -> ${highlighted.length} out`);
     // Highest suitability first. Sorting (unlike the old filtering-by-score
     // approach) never drops a paper — it only changes order — so it doesn't
     // carry the failure mode that got scoring removed once already.
@@ -608,8 +710,23 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
     }
 
-    const highlighted = await highlightPapers(question, papers);
-    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
+    const withFullText = await Promise.all(papers.map(async (p) => {
+      try {
+        const pmcid = await findPmcMatchByDoi(p.doi);
+        if (!pmcid) return p;
+        const ft = await fetchPmcFullText(pmcid);
+        return {
+          ...p, hasFullText: true,
+          pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
+          methodsExcerpt: ft.methodsExcerpt, resultsExcerpt: ft.resultsExcerpt
+        };
+      } catch {
+        return p;
+      }
+    }));
+
+    const highlighted = await highlightPapers(question, withFullText);
+    console.log(`[critical] highlightPapers: ${withFullText.length} in -> ${highlighted.length} out`);
     const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
     const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 7);
     const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 7);
