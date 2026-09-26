@@ -267,21 +267,25 @@ async function highlightChunk(question, papers) {
   const prompt = `A student is researching this question:
 "${question}"
 
-For each paper below, quote the single sentence (or clause) from ITS OWN abstract that is most relevant to this question — quoted EXACTLY as it appears, word for word, so it can be located by an exact string match. Where a paper is marked ANGLE: support, prefer a sentence that supports a hypothesis answering the question. Where marked ANGLE: challenge, prefer a sentence that challenges, contradicts, or complicates it. Where no angle is given, just quote whichever sentence is most relevant.
+For each paper below, quote the sentence(s) from ITS OWN abstract that are most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight. Only include a second (maximum two) if the abstract contains a genuinely distinct additional point relevant to the question — never pad with a weaker second quote just to have more than one. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
 
 Judge relevance by substance, not vocabulary. A paper that shares terminology with the question but is actually about a different mechanism, population, or claim is NOT relevant — do not force a highlight just because words match. If a paper doesn't genuinely engage with the substance of the question, OMIT its index from your response entirely rather than quoting a superficial or tangential sentence.
 
-Also give one short, plain sentence of context on why that sentence matters — not a verdict on relevance, just context to help the reader judge it themselves.
+For each highlight, give one short, plain sentence of context on why it matters — not a verdict on relevance, just context to help the reader judge it themselves.
+
+Also give the paper two scores (0-100), your own honest estimate — these are shown to the reader as informational context only, never used to hide or rank results, so give your genuine judgment rather than avoiding extremes:
+- "relevance": how relevant this paper is to the student's question overall
+- "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the abstract
 
 Papers:
 ${numbered}
 
 Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else:
-[{"index": 0, "highlight": "exact substring from that paper's abstract", "reason": "one short sentence of context"}]`;
+[{"index": 0, "highlights": [{"text": "exact substring from that paper's abstract", "reason": "one short sentence of context"}], "relevance": 0-100, "accuracy": 0-100}]`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 3000,
+    max_tokens: 3600,
     messages: [{ role: "user", content: prompt }]
   });
 
@@ -298,14 +302,27 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
   // Keep the original candidate order (OpenAlex/Semantic Scholar's own
   // relevance ranking) rather than however the model happened to list
   // them — the reader gets the raw search-engine ordering, not an
-  // AI re-ranking.
+  // AI re-ranking. Relevance/accuracy scores are informational only —
+  // they never filter, sort, or hide anything here.
+  const clampScore = n => (typeof n === "number" && isFinite(n)) ? Math.max(0, Math.min(100, Math.round(n))) : null;
   const byIndex = new Map(parsed.map(s => [s.index, s]));
   return papers
     .map((paper, i) => {
       const s = byIndex.get(i);
       if (!s) return null;
-      const found = s.highlight && paper.abstract.includes(s.highlight) ? s.highlight : null;
-      return { ...paper, highlight: found, reason: s.reason };
+      const rawHighlights = Array.isArray(s.highlights) ? s.highlights
+        : (s.highlight ? [{ text: s.highlight, reason: s.reason }] : []);
+      const highlights = rawHighlights
+        .filter(h => h && typeof h.text === "string" && paper.abstract.includes(h.text))
+        .slice(0, 2)
+        .map(h => ({ text: h.text, reason: typeof h.reason === "string" ? h.reason : "" }));
+      if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
+      return {
+        ...paper,
+        highlights,
+        relevance: clampScore(s.relevance),
+        accuracy: clampScore(s.accuracy)
+      };
     })
     .filter(Boolean);
 }
@@ -329,7 +346,19 @@ async function hasActiveSubscription(customerId) {
   return subs.data.some(s => s.status === "active" || s.status === "trialing");
 }
 
-// Require a valid session token AND a currently-active subscription.
+// A small allowlist for free access — the site owner's own email(s), never
+// a public signup. Comma-separated in ADMIN_EMAILS on Render. Reuses the
+// exact same passwordless login flow every real subscriber uses; the only
+// difference is the Stripe subscription check gets skipped for this email.
+function isAdminEmail(email) {
+  return (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map(e => e.trim().toLowerCase())
+    .filter(Boolean)
+    .includes((email || "").toLowerCase());
+}
+
+// Require a valid session token AND (a currently-active subscription OR an admin email).
 async function requireAuth(req, res, next) {
   // Stress-testing switch: set DISABLE_AUTH=true on Render to let every
   // request through with no login/subscription check at all. Flip it back
@@ -354,7 +383,7 @@ async function requireAuth(req, res, next) {
   if (decoded.purpose !== "session") return res.status(401).json({ error: "Invalid token" });
 
   try {
-    const active = await hasActiveSubscription(decoded.customerId);
+    const active = isAdminEmail(decoded.email) || await hasActiveSubscription(decoded.customerId);
     if (!active) return res.status(402).json({ error: "No active subscription" });
   } catch (err) {
     console.error("Stripe check failed:", err.message);
@@ -407,22 +436,29 @@ app.get("/api/checkout/confirm", async (req, res) => {
   }
 });
 
-// ---------- Request a login link (existing subscribers) ----------
+// ---------- Request a login link (existing subscribers, or an admin email) ----------
 app.post("/api/login", async (req, res) => {
   const email = (req.body.email || "").toString().trim().toLowerCase();
   if (!email || !email.includes("@")) return res.status(400).json({ error: "Valid email required" });
 
   try {
-    const customers = await stripe.customers.list({ email, limit: 5 });
-    let target = null;
-    for (const c of customers.data) {
-      if (await hasActiveSubscription(c.id)) { target = c; break; }
+    let targetId = null;
+    if (isAdminEmail(email)) {
+      // No real Stripe customer needed for an admin — "admin" is a sentinel,
+      // never sent to Stripe's API (requireAuth skips the Stripe check
+      // entirely for this email).
+      targetId = "admin";
+    } else {
+      const customers = await stripe.customers.list({ email, limit: 5 });
+      for (const c of customers.data) {
+        if (await hasActiveSubscription(c.id)) { targetId = c.id; break; }
+      }
     }
 
-    // Always respond the same way whether or not we found a subscriber —
-    // don't let this endpoint reveal who is or isn't a customer.
-    if (target) {
-      const magicToken = signMagicToken(email, target.id);
+    // Always respond the same way whether or not we found a match — don't
+    // let this endpoint reveal who is or isn't a customer/admin.
+    if (targetId) {
+      const magicToken = signMagicToken(email, targetId);
       const link = `${APP_URL}/?magic=${encodeURIComponent(magicToken)}`;
       try {
         await resend.emails.send({
@@ -461,6 +497,9 @@ app.get("/api/login/confirm", async (req, res) => {
 
 // ---------- Stripe-hosted billing management page ----------
 app.get("/api/billing-portal", requireAuth, async (req, res) => {
+  if (req.customerId === "admin") {
+    return res.status(400).json({ error: "Admin accounts don't have a billing subscription to manage." });
+  }
   try {
     const portal = await stripe.billingPortal.sessions.create({
       customer: req.customerId,
