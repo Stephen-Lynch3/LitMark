@@ -637,6 +637,7 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
 app.get("/api/search", requireAuth, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
+  const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
 
   try {
     const searchQuery = await buildSearchQuery(question);
@@ -661,7 +662,10 @@ app.get("/api/search", requireAuth, async (req, res) => {
     });
 
     const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
-    const papers = interleaveBySource(requireTermMatch(allFound, [searchQuery, question])).slice(0, 36);
+    // A paper with no year on record is kept rather than penalized —
+    // only papers we KNOW are older than the cutoff are excluded.
+    const dateFiltered = minYear ? allFound.filter(p => !p.year || p.year >= minYear) : allFound;
+    const papers = interleaveBySource(requireTermMatch(dateFiltered, [searchQuery, question])).slice(0, 36);
 
     // Breaks candidate counts down by source at each stage — this is what
     // actually shows whether a source is quietly contributing nothing,
@@ -729,6 +733,7 @@ app.get("/api/search", requireAuth, async (req, res) => {
 app.get("/api/critical-search", requireAuth, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
+  const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
 
   try {
     const [supportQuery, counterQuery] = await Promise.all([
@@ -745,13 +750,15 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
 
+    const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
+
     // support-first, so a paper found by both searches defaults to the
     // "support" column rather than appearing twice or being dropped
     const supportPapers = requireTermMatch(
-      supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : []), [supportQuery]
+      dateFilter(supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [supportQuery]
     ).map(p => ({ ...p, angle: "support" }));
     const counterPapers = requireTermMatch(
-      counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : []), [counterQuery]
+      dateFilter(counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [counterQuery]
     ).map(p => ({ ...p, angle: "challenge" }));
     const papers = interleaveBySource(dedupe([...supportPapers, ...counterPapers])).slice(0, 30);
 
@@ -1149,6 +1156,39 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
 
   return { query, concepts };
 }
+
+// ---------- Summarise a saved source ----------
+// Explicitly a paraphrase/summary task, not a quoting one — the prompt
+// asks for the paper's useful information in Claude's own words, tied to
+// why the student saved it, not a reproduction of the abstract.
+app.post("/api/summarize-source", requireAuth, async (req, res) => {
+  const question = (req.body.question || "").toString().trim();
+  const title = (req.body.title || "").toString().trim();
+  const abstract = (req.body.abstract || "").toString().trim();
+  if (!abstract) return res.status(400).json({ error: "Missing abstract" });
+
+  try {
+    const prompt = `A student is researching this question:
+"${question}"
+
+They've saved this paper to their sources:
+Title: ${title}
+Abstract: ${abstract}
+
+In 1-2 short, succinct sentences, pull out — in your own words, not quoting the abstract — the single most useful piece of information in this paper for answering their question. Skip anything in the abstract that isn't relevant. If the paper turns out not to be very useful for this question after all, say so plainly in one line rather than padding out a summary.`;
+
+    const msg = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 300,
+      messages: [{ role: "user", content: prompt }]
+    });
+    const summary = msg.content.find(b => b.type === "text")?.text?.trim() || "";
+    res.json({ summary });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Summarize failed", detail: err.message });
+  }
+});
 
 app.get("/api/lexicon", requireAuth, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
