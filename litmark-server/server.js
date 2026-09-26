@@ -288,6 +288,16 @@ function requireTermMatch(papers, queries) {
   const terms = [...new Set(queries.flatMap(extractKeyTerms))];
   if (terms.length === 0) return papers;
   return papers.filter(p => {
+    // Europe PMC's own search already applied this exact query server-side
+    // (with OPEN_ACCESS:Y) before ever returning a result, so its relevance
+    // ranking can be trusted as-is. Re-checking for a literal keyword
+    // substring in the returned abstract was found to wrongly reject the
+    // large majority of genuinely relevant Europe PMC results (33 of 35
+    // candidates in one real search) — its ranking works by MeSH terms and
+    // synonyms, not just literal keyword occurrence, so a real match often
+    // doesn't share the searched words verbatim in the abstract text
+    // itself (e.g. "Cyp1a2-null mice" for a search on "knockout").
+    if (p.source === "Europe PMC") return true;
     const text = (p.abstract || "").toLowerCase();
     return terms.some(t => text.includes(t));
   });
