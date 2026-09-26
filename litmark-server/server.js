@@ -196,6 +196,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       authors: (r.authorString || "").split(", ").slice(0, 4).join(", "),
       oaUrl: oaLink,
       isOA: r.isOpenAccess === "Y",
+      pmcid: r.pmcid || null,
       doi: r.doi || null,
       abstract: r.abstractText || null
     };
@@ -638,9 +639,16 @@ app.get("/api/search", requireAuth, async (req, res) => {
     // lets Claude consider Methods/Results, not just the abstract, when
     // picking a highlight. Failures here just fall back to abstract-only
     // for that one paper; they never break the search.
-    const withFullText = await Promise.all(papers.map(async (p) => {
+    //
+    // Throttled to 4 at a time (not all-at-once) — firing dozens of
+    // simultaneous requests at Europe PMC in one burst was found to trip
+    // its rate limiting, which broke Europe PMC results entirely for that
+    // search. A paper that already came from Europe PMC's own search
+    // already carries its pmcid, so it skips the extra DOI lookup — only
+    // OpenAlex/Semantic-Scholar-only papers need it.
+    const withFullText = await mapWithConcurrency(papers, 4, async (p) => {
       try {
-        const pmcid = await findPmcMatchByDoi(p.doi);
+        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
         if (!pmcid) return p;
         const ft = await fetchPmcFullText(pmcid);
         return {
@@ -651,7 +659,7 @@ app.get("/api/search", requireAuth, async (req, res) => {
       } catch {
         return p;
       }
-    }));
+    });
     console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} candidates`);
 
     const highlighted = await highlightPapers(question, withFullText);
@@ -710,9 +718,9 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
     }
 
-    const withFullText = await Promise.all(papers.map(async (p) => {
+    const withFullText = await mapWithConcurrency(papers, 4, async (p) => {
       try {
-        const pmcid = await findPmcMatchByDoi(p.doi);
+        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
         if (!pmcid) return p;
         const ft = await fetchPmcFullText(pmcid);
         return {
@@ -723,7 +731,7 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       } catch {
         return p;
       }
-    }));
+    });
 
     const highlighted = await highlightPapers(question, withFullText);
     console.log(`[critical] highlightPapers: ${withFullText.length} in -> ${highlighted.length} out`);
