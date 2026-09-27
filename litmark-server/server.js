@@ -38,6 +38,26 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// Every feature in this app depends on a Claude call succeeding — unlike
+// the search-source APIs, which each contribute one of several, a Claude
+// failure previously killed the entire request outright, with no recovery
+// attempt at all. Retries only on a transient failure (rate limit, server
+// error, or a network-level failure with no status at all); a genuine
+// client error (bad request, auth) is rethrown immediately rather than
+// retried, since retrying an invalid request would just fail again.
+async function createMessageWithRetry(params, retries = 2, delayMs = 800) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await anthropic.messages.create(params);
+    } catch (err) {
+      const status = err?.status;
+      const isTransient = status === 429 || (typeof status === "number" && status >= 500) || !status;
+      if (!isTransient || attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+    }
+  }
+}
 // A placeholder key lets the server boot even before Stripe/Resend are
 // configured — actual billing calls will fail loudly with a clear error
 // (not a server crash) until real keys are set.
@@ -62,7 +82,7 @@ const FROM_EMAIL = process.env.FROM_EMAIL || "LitMark <onboarding@resend.dev>";
 
 // ---------- Turn a natural-language question into a search-engine query ----------
 async function buildSearchQuery(question) {
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 60,
     temperature: 0, // a judgment/extraction task, not creative writing — the same
@@ -82,7 +102,7 @@ async function buildSearchQuery(question) {
 // findings, failed replications, limitations. Used only for Critical
 // Analysis mode, so counter-evidence is actively sought, not just hoped for.
 async function buildCounterQuery(question) {
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 60,
     temperature: 0,
@@ -231,7 +251,50 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
 
-// Given ANY paper's DOI (regardless of whether OpenAlex, Semantic Scholar,
+// ---------- Source 4: CORE ----------
+// The largest open-access aggregator (260M+ records from 10,000+
+// repositories), with particularly strong coverage of preprints, theses,
+// and institutional-repository content that OpenAlex, Semantic Scholar,
+// and Europe PMC don't fully overlap with. Anonymous access is heavily
+// rate-limited, so genuinely useful results need a free key from
+// core.ac.uk/services/api — without one, this source is skipped entirely
+// rather than hitting the heavily-throttled anonymous tier, and the
+// search simply proceeds on the other three sources, exactly as it
+// already does when any one source fails for any other reason.
+async function searchCORE(query, { requireOA = true } = {}) {
+  if (!process.env.CORE_API_KEY) return [];
+  const url = new URL("https://api.core.ac.uk/v3/search/works");
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", "30");
+  const headers = { Authorization: `Bearer ${process.env.CORE_API_KEY}` };
+
+  const res = await fetchWithRetry(url, { headers });
+  if (!res.ok) throw new Error(`CORE ${res.status}`);
+  const data = await res.json();
+
+  return (data.results || [])
+    .map(w => {
+      const oaLink = w.downloadUrl || (w.doi ? `https://doi.org/${w.doi}` : null);
+      return {
+        source: "CORE",
+        id: w.coreId || w.id,
+        title: w.title,
+        // Different CORE docs/examples show this field two different ways
+        // (yearPublished vs year) — checking both rather than betting on one.
+        year: w.yearPublished || w.year || null,
+        journal: (Array.isArray(w.journals) && w.journals[0]) || w.publisher || "Unknown venue",
+        authors: (Array.isArray(w.authors) ? w.authors : []).slice(0, 4).join(", "),
+        oaUrl: oaLink,
+        isOA: true, // CORE indexes open-access content by design
+        doi: w.doi || null,
+        citedByCount: typeof w.citationCount === "number" ? w.citationCount : null,
+        abstract: w.abstract || null
+      };
+    })
+    .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+}
+
+
 // or Europe PMC's own topic search originally found it), check whether
 // Europe PMC separately has it indexed with full text available. This is
 // how full-text coverage extends beyond papers Europe PMC's own search
@@ -245,7 +308,7 @@ async function findPmcMatchByDoi(doi) {
     url.searchParams.set("query", `DOI:"${cleanDoi}"`);
     url.searchParams.set("format", "json");
     url.searchParams.set("pageSize", "1");
-    const res = await fetch(url);
+    const res = await fetchWithRetry(url);
     if (!res.ok) return null;
     const data = await res.json();
     const hit = data.resultList?.result?.[0];
@@ -403,15 +466,19 @@ async function highlightPapers(question, papers) {
 }
 
 async function highlightChunk(question, papers) {
-  const numbered = papers.map((p, i) =>
-    `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`
-  ).join("\n\n");
+  const numbered = papers.map((p, i) => {
+    let block = `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`;
+    if (p.methodsExcerpt) block += `\nMETHODS EXCERPT: ${p.methodsExcerpt}`;
+    if (p.resultsExcerpt) block += `\nRESULTS EXCERPT: ${p.resultsExcerpt}`;
+    return block;
+  }).join("\n\n");
+  const anyFullText = papers.some(p => p.methodsExcerpt || p.resultsExcerpt);
 
   const prompt = `A student is researching this question:
 "${question}"
 
-For each paper below, quote the sentence(s) from ITS OWN abstract that are most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight. Only include a second (maximum two) if the abstract contains a genuinely distinct additional point relevant to the question — never pad with a weaker second quote just to have more than one. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
-
+For each paper below, quote the sentence(s) most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight. Only include a second (maximum two) if there's a genuinely distinct additional point relevant to the question — never pad with a weaker second quote just to have more than one. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
+${anyFullText ? '\nSome papers include METHODS EXCERPT and/or RESULTS EXCERPT sections in addition to the abstract — real excerpts from the paper\'s full text. A quote from one of these can often be more specific and useful than the abstract alone (e.g. an actual effect size or exact method used). Prefer quoting from Methods/Results over the abstract when it genuinely gives the reader more useful detail, but the abstract is still perfectly fine when it already says what matters most. Mark which section each quote came from.\n' : ''}
 Judge relevance by substance, not vocabulary. A paper that shares terminology with the question but is actually about a different mechanism, population, or claim is NOT relevant — do not force a highlight just because words match. If a paper doesn't genuinely engage with the substance of the question, OMIT its index from your response entirely rather than quoting a superficial or tangential sentence.
 
 For each highlight, give one short, plain sentence of context on why it matters — not a verdict on relevance, just context to help the reader judge it themselves.
@@ -423,10 +490,10 @@ Also give the paper two scores (0-100), your own honest estimate — these are s
 Papers:
 ${numbered}
 
-Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else:
-[{"index": 0, "highlights": [{"text": "exact substring from that paper's abstract", "reason": "one short sentence of context"}], "relevance": 0-100, "accuracy": 0-100}]`;
+Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else — "section" must be exactly "abstract", "methods", or "results", matching which text the quote came from:
+[{"index": 0, "highlights": [{"text": "exact substring", "reason": "one short sentence of context", "section": "abstract"}], "relevance": 0-100, "accuracy": 0-100}]`;
 
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 3600,
     temperature: 0, // relevance/highlight judgment, not creative writing — the
@@ -456,13 +523,21 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
       const s = byIndex.get(i);
       if (!s) return null;
       const rawHighlights = Array.isArray(s.highlights) ? s.highlights
-        : (s.highlight ? [{ text: s.highlight, reason: s.reason }] : []);
+        : (s.highlight ? [{ text: s.highlight, reason: s.reason, section: s.section }] : []);
       // A highlight is only kept if its quoted text is genuinely locatable
-      // in the abstract — this is what stops a fabricated or
-      // misattributed quote from ever reaching the reader.
+      // in the SPECIFIC source text it claims to come from — this is what
+      // stops a fabricated or misattributed quote from ever reaching the
+      // reader, now checked against the right source (abstract, methods,
+      // or results) rather than always the abstract.
+      const sourceFor = section => section === 'methods' ? paper.methodsExcerpt
+        : section === 'results' ? paper.resultsExcerpt
+        : paper.abstract;
       const highlights = rawHighlights
-        .map(h => ({ text: h?.text, reason: typeof h?.reason === "string" ? h.reason : "" }))
-        .filter(h => h.text && paper.abstract && paper.abstract.includes(h.text))
+        .map(h => {
+          const section = ['abstract','methods','results'].includes(h?.section) ? h.section : 'abstract';
+          return { text: h?.text, reason: typeof h?.reason === "string" ? h.reason : "", section };
+        })
+        .filter(h => h.text && sourceFor(h.section) && sourceFor(h.section).includes(h.text))
         .slice(0, 2);
       if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
 
@@ -689,9 +764,11 @@ app.get("/api/search", requireAuth, async (req, res) => {
       searchOpenAlex(question),
       searchSemanticScholar(question),
       searchEuropePMC(searchQuery),
-      searchEuropePMC(question)
+      searchEuropePMC(question),
+      searchCORE(searchQuery),
+      searchCORE(question)
     ]);
-    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)"];
+    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)", "CORE(query)", "CORE(raw)"];
     fetches.forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
       else console.log(`${labels[i]}: ${f.value.length} results`);
@@ -732,24 +809,51 @@ app.get("/api/search", requireAuth, async (req, res) => {
     const results = sorted.slice(0, 20);
 
     // Full-text availability is checked only on the papers actually being
-    // shown, not the full candidate pool — this used to run before
-    // highlighting on all 36 candidates so a highlight could be drawn from
-    // Methods/Results too, but that meant checking ~16 papers that never
-    // even made it to the screen. Checking after slicing, on just these
-    // ~20, is meaningfully cheaper — the trade is that a highlight can now
-    // only come from the abstract, never Methods/Results.
+    // shown, not the full candidate pool — checking all 36 candidates
+    // before highlighting used to mean checking ~16 papers that never even
+    // made it to the screen. Checking after slicing, on just these ~20,
+    // is meaningfully cheaper.
     const withFullText = await mapWithConcurrency(results, 4, async (p) => {
       try {
         const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
         if (!pmcid) return p;
-        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/` };
+        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
       } catch {
         return p;
       }
     });
     console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} shown results`);
 
-    res.json({ results: withFullText, searchQuery });
+    // For the (typically much smaller) subset that has full text, fetch
+    // the actual Methods/Results excerpts and re-run highlighting just for
+    // those — cheap now, since it only touches papers that already made
+    // the final cut, not the full 36-candidate pool this used to run on
+    // before full text was moved after slicing. Gives Claude a real shot
+    // at a more specific highlight than the abstract alone offers. If this
+    // step fails for any reason, or a paper's re-highlight comes back
+    // empty, the paper keeps its existing abstract-only highlight rather
+    // than being dropped — this only ever adds depth, never removes it.
+    const withExcerpts = await mapWithConcurrency(withFullText, 4, async (p) => {
+      if (!p.hasFullText) return p;
+      try {
+        const excerpts = await fetchPmcFullText(p.pmcid);
+        if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
+        return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
+      } catch {
+        return p;
+      }
+    });
+
+    const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
+    let finalResults = withExcerpts;
+    if (toReHighlight.length > 0) {
+      const reHighlighted = await highlightPapers(question, toReHighlight);
+      const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
+      finalResults = withExcerpts.map(p => byIdRe.get(p.id) || p);
+      console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates -> ${reHighlighted.length} improved`);
+    }
+
+    res.json({ results: finalResults, searchQuery });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Search failed", detail: err.message });
@@ -774,10 +878,10 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
     ]);
 
     const [supportFetches, counterFetches] = await Promise.all([
-      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchEuropePMC(supportQuery)]),
-      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchEuropePMC(counterQuery)])
+      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchEuropePMC(supportQuery), searchCORE(supportQuery)]),
+      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchEuropePMC(counterQuery), searchCORE(counterQuery)])
     ]);
-    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)"];
+    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)"];
     [...supportFetches, ...counterFetches].forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
@@ -808,14 +912,12 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
 
     // Same principle as /api/search: full-text availability is only
     // checked on the papers actually being shown (up to 14 here, not the
-    // full candidate pool), and only for the "Show full paper" link — a
-    // highlight can no longer be drawn from Methods/Results, only the
-    // abstract, in exchange for real speed.
+    // full candidate pool).
     const checkFullText = async (list) => mapWithConcurrency(list, 4, async (p) => {
       try {
         const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
         if (!pmcid) return p;
-        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/` };
+        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
       } catch {
         return p;
       }
@@ -824,7 +926,33 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       checkFullText(supports), checkFullText(challenges)
     ]);
 
-    res.json({ supports: supportsWithFullText, challenges: challengesWithFullText, supportQuery, counterQuery });
+    // Same re-highlighting step as /api/search: fetch real Methods/Results
+    // excerpts for the (typically small) subset with full text available,
+    // and give Claude a chance to find a more specific quote than the
+    // abstract alone. A paper keeps its existing highlight if this step
+    // fails or comes back empty for it — this only ever adds depth.
+    const combined = [...supportsWithFullText, ...challengesWithFullText];
+    const withExcerpts = await mapWithConcurrency(combined, 4, async (p) => {
+      if (!p.hasFullText) return p;
+      try {
+        const excerpts = await fetchPmcFullText(p.pmcid);
+        if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
+        return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
+      } catch {
+        return p;
+      }
+    });
+    const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
+    let finalCombined = withExcerpts;
+    if (toReHighlight.length > 0) {
+      const reHighlighted = await highlightPapers(question, toReHighlight);
+      const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
+      finalCombined = withExcerpts.map(p => byIdRe.get(p.id) || p);
+    }
+    const finalSupports = finalCombined.filter(p => p.angle === "support");
+    const finalChallenges = finalCombined.filter(p => p.angle === "challenge");
+
+    res.json({ supports: finalSupports, challenges: finalChallenges, supportQuery, counterQuery });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Critical analysis failed", detail: err.message });
@@ -889,7 +1017,7 @@ Respond with ONLY a JSON array, nothing else, in this shape:
 
 Only extract citations that actually appear in this excerpt's own body text — ignore reference-list entries that aren't cited here.`;
 
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 3000,
     temperature: 0, // extraction task — the same essay text should yield the same extracted citations every time
@@ -992,7 +1120,8 @@ async function lookupPaper({ guessTitle, guessAuthor, guessYear, guessDoi }) {
   const results = await Promise.allSettled([
     searchOpenAlex(query, { requireOA: false }),
     searchSemanticScholar(query, { requireOA: false }),
-    searchEuropePMC(query, { requireOA: false })
+    searchEuropePMC(query, { requireOA: false }),
+    searchCORE(query, { requireOA: false })
   ]);
   const candidates = dedupe(results.flatMap(r => r.status === "fulfilled" ? r.value : []));
   if (candidates.length === 0) return null;
@@ -1035,7 +1164,7 @@ Does the abstract genuinely support the claim as written? Respond with ONLY JSON
 - misrepresented: the claim says something the abstract doesn't support or actually contradicts
 - unrelated: the abstract doesn't address the claim's topic at all`;
 
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 200,
     temperature: 0, // fidelity judgment — the same claim/abstract pair should get the same verdict every time
@@ -1211,7 +1340,7 @@ Do NOT blindly treat merely related concepts as synonyms of each other — a con
 Respond with ONLY JSON in this exact shape, nothing else — plain terms only, no quote marks or search syntax inside the strings themselves:
 {"concepts": [{"name": "Concept name", "terms": ["term1", "term2", "term3"]}]}`;
 
-  const msg = await anthropic.messages.create({
+  const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 1000,
     temperature: 0,
@@ -1275,7 +1404,7 @@ Abstract: ${abstract}
 
 In 1-2 short, succinct sentences, pull out — in your own words, not quoting the abstract — the single most useful piece of information in this paper for answering their question. Skip anything in the abstract that isn't relevant. If the paper turns out not to be very useful for this question after all, say so plainly in one line rather than padding out a summary.`;
 
-    const msg = await anthropic.messages.create({
+    const msg = await createMessageWithRetry({
       model: MODEL,
       max_tokens: 300,
       temperature: 0,
@@ -1315,7 +1444,7 @@ ${numbered}
 
 Write a short SYNTHESIS — not a list describing each paper one by one — of what these sources, taken together, actually say about the question. In your own words, never quoting the abstracts directly. Note where the sources agree, where they diverge or add different angles, and what the overall picture looks like across all of them combined. If the saved papers don't actually cover the question well as a set, say so plainly. Keep it to one tight paragraph, not an essay.`;
 
-    const msg = await anthropic.messages.create({
+    const msg = await createMessageWithRetry({
       model: MODEL,
       max_tokens: 500,
       temperature: 0,
