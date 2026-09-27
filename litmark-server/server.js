@@ -123,7 +123,7 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
   url.searchParams.set("per-page", "30");
   url.searchParams.set("select", [
     "id", "title", "publication_year", "authorships",
-    "primary_location", "open_access", "abstract_inverted_index", "doi"
+    "primary_location", "open_access", "abstract_inverted_index", "doi", "cited_by_count"
   ].join(","));
   url.searchParams.set("mailto", CONTACT_EMAIL);
 
@@ -144,6 +144,7 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
       oaUrl: oaLink,
       isOA: !!w.open_access?.is_oa,
       doi: w.doi,
+      citedByCount: typeof w.cited_by_count === "number" ? w.cited_by_count : null,
       abstract: reconstructAbstract(w.abstract_inverted_index)
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -164,7 +165,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
   url.searchParams.set("limit", "30");
-  url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds");
+  url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount");
 
   const headers = process.env.SEMANTIC_SCHOLAR_API_KEY
     ? { "x-api-key": process.env.SEMANTIC_SCHOLAR_API_KEY }
@@ -186,6 +187,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       oaUrl: p.openAccessPdf?.url || null,
       isOA: !!p.openAccessPdf?.url,
       doi: p.externalIds?.DOI,
+      citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
       abstract: p.abstract
     }));
 }
@@ -223,6 +225,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       isOA: r.isOpenAccess === "Y",
       pmcid: r.pmcid || null,
       doi: r.doi || null,
+      citedByCount: typeof r.citedByCount === "number" ? r.citedByCount : null,
       abstract: r.abstractText ? stripXmlTags(r.abstractText) : null
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -1063,6 +1066,7 @@ async function auditEssayText(essayText) {
       matchedYear: paper?.year || null,
       matchedAuthors: paper?.authors || null,
       matchedOA: paper ? !!paper.isOA : null,
+      matchedCitedByCount: typeof paper?.citedByCount === "number" ? paper.citedByCount : null,
       ...verdict
     };
   });
@@ -1276,6 +1280,30 @@ app.get("/api/lexicon", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Lexicon generation failed", detail: err.message });
+  }
+});
+
+// ---------- How many results would this Boolean query actually return? ----------
+// Europe PMC mirrors PubMed's full corpus, so its hitCount for a query is a
+// genuine, real-time estimate of what that same query would return on
+// PubMed itself — a single cheap request (pageSize 1, we only want the
+// count), not a real search or any content fetch.
+app.get("/api/pubmed-count", requireAuth, async (req, res) => {
+  const q = (req.query.q || "").toString().trim();
+  if (!q) return res.status(400).json({ error: "Missing query param: q" });
+
+  try {
+    const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
+    url.searchParams.set("query", q);
+    url.searchParams.set("format", "json");
+    url.searchParams.set("pageSize", "1");
+    const r = await fetchWithRetry(url);
+    if (!r.ok) throw new Error(`Europe PMC ${r.status}`);
+    const data = await r.json();
+    res.json({ count: typeof data.hitCount === "number" ? data.hitCount : null });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Could not estimate result count", detail: err.message });
   }
 });
 
