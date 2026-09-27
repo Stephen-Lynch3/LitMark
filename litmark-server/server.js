@@ -29,6 +29,7 @@ import jwt from "jsonwebtoken";
 import { Resend } from "resend";
 import multer from "multer";
 import mammoth from "mammoth";
+import { randomUUID } from "crypto";
 import "dotenv/config";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
@@ -561,8 +562,27 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
 // live, every time, rather than stored anywhere on our side.
 // =====================================================================
 
+const activeSessions = new Map(); // customerId -> array of sessionIds, oldest first
+const MAX_CONCURRENT_SESSIONS = 2;
+
 function signSessionToken(email, customerId) {
-  return jwt.sign({ email, customerId, purpose: "session" }, JWT_SECRET, { expiresIn: "30d" });
+  // Session tracking, on top of the hourly rate limit: allows up to 2
+  // concurrent logins per account (covers one person's own laptop + phone,
+  // completely normal and never worth penalising), and automatically logs
+  // out the OLDEST session the moment a 3rd concurrent login happens. This
+  // catches genuine multi-person sharing directly, at the moment it
+  // happens, rather than only after enough combined volume trips the rate
+  // limit — the two mechanisms cover different sharing patterns (this one
+  // catches simultaneous use; the rate limit catches sequential/heavy use).
+  const sessionId = randomUUID();
+  const sessions = activeSessions.get(customerId) || [];
+  sessions.push(sessionId);
+  while (sessions.length > MAX_CONCURRENT_SESSIONS) {
+    sessions.shift(); // evict the oldest first
+    console.warn(`[session-limit] FLAGGED: ${email} logged in on a 3rd concurrent device — oldest session evicted. Possible account sharing.`);
+  }
+  activeSessions.set(customerId, sessions);
+  return jwt.sign({ email, customerId, sessionId, purpose: "session" }, JWT_SECRET, { expiresIn: "30d" });
 }
 function signMagicToken(email, customerId) {
   return jwt.sign({ email, customerId, purpose: "magic" }, JWT_SECRET, { expiresIn: "15m" });
@@ -610,6 +630,16 @@ async function requireAuth(req, res, next) {
   }
   if (decoded.purpose !== "session") return res.status(401).json({ error: "Invalid token" });
 
+  // Session still valid, or was it evicted by a 3rd concurrent login?
+  // Admin accounts are exempt, same as the rate limit — this is about
+  // catching real customer sharing, not restricting your own testing.
+  if (decoded.customerId !== "admin") {
+    const sessions = activeSessions.get(decoded.customerId) || [];
+    if (!sessions.includes(decoded.sessionId)) {
+      return res.status(401).json({ error: "You've been logged out because this account signed in on a new device. If this wasn't you, someone else may be using your login." });
+    }
+  }
+
   try {
     const active = isAdminEmail(decoded.email) || await hasActiveSubscription(decoded.customerId);
     if (!active) return res.status(402).json({ error: "No active subscription" });
@@ -620,6 +650,42 @@ async function requireAuth(req, res, next) {
 
   req.email = decoded.email;
   req.customerId = decoded.customerId;
+  next();
+}
+
+// ---------- Per-account rate limiting ----------
+// Discourages one paid account being shared across multiple people by
+// capping how many AI-costing requests a single account can make within a
+// rolling hour. Deliberately generous — a genuine single student, even on
+// a heavy assignment day, should never come close to this; it's aimed at
+// clear multi-person sharing, not normal use. Kept in memory rather than
+// a database for simplicity — it resets on a redeploy, an acceptable
+// trade-off for a first version, and this instance only runs one process
+// (WEB_CONCURRENCY=1), so there's no cross-process consistency issue yet.
+const usageLog = new Map(); // email -> array of request timestamps (ms)
+const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+// Configurable via Render's environment variables without needing a code
+// change — RATE_LIMIT_MAX=20 by default. Lowered from an earlier, more
+// generous 40: a genuine single student, even on a busy one-assignment
+// day, rarely exceeds 20 actions in a single hour, while even a modest
+// two-person sharing scenario (10 each) comfortably trips this — three or
+// more sharing an account becomes very hard to avoid hitting it at all.
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "20", 10);
+
+function rateLimit(req, res, next) {
+  if (process.env.DISABLE_AUTH === "true") return next(); // stress-testing bypass, same as requireAuth
+  if (isAdminEmail(req.email)) return next(); // the account owner's own free access is exempt
+  const now = Date.now();
+  const timestamps = (usageLog.get(req.email) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (timestamps.length >= RATE_LIMIT_MAX) {
+    // Visible to you in Render's logs — the block itself already protects
+    // against sharing, but without this you'd have no way to actually see
+    // it happening or notice a pattern worth investigating.
+    console.warn(`[rate-limit] FLAGGED: ${req.email} hit ${timestamps.length} requests in the last hour (limit: ${RATE_LIMIT_MAX}) — possible account sharing.`);
+    return res.status(429).json({ error: "This account has made a lot of requests in the last hour. If this account is being shared, each person needs their own subscription — otherwise, just try again shortly." });
+  }
+  timestamps.push(now);
+  usageLog.set(req.email, timestamps);
   next();
 }
 
@@ -745,7 +811,7 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
 });
 
 // ---------- Search (subscribers only) ----------
-app.get("/api/search", requireAuth, async (req, res) => {
+app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
@@ -866,7 +932,7 @@ app.get("/api/search", requireAuth, async (req, res) => {
 // OWN search found it in. No post-hoc "does this support or challenge"
 // judgment call on Claude's part, so there's no failure mode where
 // everything gets classified as ambiguous and both columns end up empty.
-app.get("/api/critical-search", requireAuth, async (req, res) => {
+app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
@@ -1264,7 +1330,7 @@ async function auditEssayText(essayText) {
   return { results, bibliography };
 }
 
-app.post("/api/audit-essay", requireAuth, async (req, res) => {
+app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
   const essayText = (req.body.essay || "").toString().trim();
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
   if (essayText.length > 100000) return res.status(400).json({ error: "Essay too long — 100,000 characters max (around 15,000 words)" });
@@ -1282,7 +1348,7 @@ app.post("/api/audit-essay", requireAuth, async (req, res) => {
 // is the one genuinely new failure mode here — .docx is a zipped bundle of
 // XML under the hood, handled by the well-established `mammoth` library
 // rather than anything hand-rolled.
-app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (req, res) => {
+app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const name = (req.file.originalname || "").toLowerCase();
 
@@ -1388,7 +1454,7 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
 // Explicitly a paraphrase/summary task, not a quoting one — the prompt
 // asks for the paper's useful information in Claude's own words, tied to
 // why the student saved it, not a reproduction of the abstract.
-app.post("/api/summarize-source", requireAuth, async (req, res) => {
+app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const title = (req.body.title || "").toString().trim();
   const abstract = (req.body.abstract || "").toString().trim();
@@ -1424,7 +1490,7 @@ In 1-2 short, succinct sentences, pull out — in your own words, not quoting th
 // across all the saved abstracts at once (agreement, disagreement,
 // overall picture), in its own words, rather than describing each paper
 // one by one.
-app.post("/api/summarize-folder", requireAuth, async (req, res) => {
+app.post("/api/summarize-folder", requireAuth, rateLimit, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const papers = Array.isArray(req.body.papers) ? req.body.papers.slice(0, 20) : [];
   const withAbstracts = papers.filter(p => p && (p.abstract || "").toString().trim());
@@ -1458,7 +1524,7 @@ Write a short SYNTHESIS — not a list describing each paper one by one — of w
   }
 });
 
-app.get("/api/lexicon", requireAuth, async (req, res) => {
+app.get("/api/lexicon", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
 
