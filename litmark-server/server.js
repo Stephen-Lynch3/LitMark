@@ -52,7 +52,8 @@ const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
 const MODEL = "claude-haiku-4-5-20251001";
 const JWT_SECRET = process.env.JWT_SECRET || "";
 const APP_URL = (process.env.APP_URL || "http://localhost:3787").replace(/\/$/, "");
-const PRICE_ID = process.env.STRIPE_PRICE_ID || "";
+const PRICE_ID = process.env.STRIPE_PRICE_ID || ""; // monthly — kept as the original name for backward compatibility
+const PRICE_ID_ANNUAL = process.env.STRIPE_PRICE_ID_ANNUAL || "";
 const FROM_EMAIL = process.env.FROM_EMAIL || "LitMark <onboarding@resend.dev>";
 
 // ---------- Turn a natural-language question into a search-engine query ----------
@@ -198,7 +199,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       isOA: r.isOpenAccess === "Y",
       pmcid: r.pmcid || null,
       doi: r.doi || null,
-      abstract: r.abstractText || null
+      abstract: r.abstractText ? stripXmlTags(r.abstractText) : null
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
@@ -285,8 +286,21 @@ function extractKeyTerms(query) {
   )];
 }
 function requireTermMatch(papers, queries) {
-  const terms = [...new Set(queries.flatMap(extractKeyTerms))];
-  if (terms.length === 0) return papers;
+  const allTerms = [...new Set(queries.flatMap(extractKeyTerms))];
+  if (allTerms.length === 0) return papers;
+
+  // A distinctive identifier (contains both a letter and a digit — typical
+  // of gene/protein/chemical names like "gstz1" or "cyp2a6") is far more
+  // specific than a generic accompanying word like "gene" or "deletion".
+  // Requiring only ANY term to match let through many genuinely unrelated
+  // papers that happened to share common vocabulary but were never
+  // actually about the specific thing being searched for — Claude's own
+  // highlighting step then correctly rejected them, but only after
+  // wasting real cost on a candidate pool that was mostly noise. When a
+  // distinctive identifier is present, require IT specifically.
+  const distinctiveTerms = allTerms.filter(t => /[a-z]/.test(t) && /[0-9]/.test(t));
+  const requiredTerms = distinctiveTerms.length > 0 ? distinctiveTerms : allTerms;
+
   return papers.filter(p => {
     // Europe PMC's own search already applied this exact query server-side
     // (with OPEN_ACCESS:Y) before ever returning a result, so its relevance
@@ -299,7 +313,7 @@ function requireTermMatch(papers, queries) {
     // itself (e.g. "Cyp1a2-null mice" for a search on "knockout").
     if (p.source === "Europe PMC") return true;
     const text = (p.abstract || "").toLowerCase();
-    return terms.some(t => text.includes(t));
+    return requiredTerms.some(t => text.includes(t));
   });
 }
 
@@ -362,17 +376,14 @@ async function highlightPapers(question, papers) {
 }
 
 async function highlightChunk(question, papers) {
-  const numbered = papers.map((p, i) => {
-    let block = `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`;
-    if (p.methodsExcerpt) block += `\nMETHODS EXCERPT: ${p.methodsExcerpt}`;
-    if (p.resultsExcerpt) block += `\nRESULTS EXCERPT: ${p.resultsExcerpt}`;
-    return block;
-  }).join("\n\n");
+  const numbered = papers.map((p, i) =>
+    `[${i}]${p.angle ? ' ANGLE: ' + p.angle : ''}\nTITLE: ${p.title}\nABSTRACT: ${p.abstract}`
+  ).join("\n\n");
 
   const prompt = `A student is researching this question:
 "${question}"
 
-For each paper below, quote the sentence(s) most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight, drawn from the ABSTRACT. Only include a second (maximum two) if there's a genuinely distinct additional point — never pad with a weaker second quote just to have more than one. Where a paper also has a METHODS EXCERPT or RESULTS EXCERPT, you may quote from one of those instead of (or in addition to) the abstract if it contains something more specifically relevant than anything in the abstract — but don't force it; most highlights should still come from the abstract, since that's where a paper's own summary of what matters usually lives. Say which section each quote came from. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
+For each paper below, quote the sentence(s) from ITS OWN abstract that are most relevant to this question — quoted EXACTLY as they appear, word for word, so each can be located by an exact string match. Most papers only need ONE quoted highlight. Only include a second (maximum two) if the abstract contains a genuinely distinct additional point relevant to the question — never pad with a weaker second quote just to have more than one. Where a paper is marked ANGLE: support, prefer sentences that support a hypothesis answering the question. Where marked ANGLE: challenge, prefer sentences that challenge, contradict, or complicate it. Where no angle is given, just quote whichever sentence(s) are most relevant.
 
 Judge relevance by substance, not vocabulary. A paper that shares terminology with the question but is actually about a different mechanism, population, or claim is NOT relevant — do not force a highlight just because words match. If a paper doesn't genuinely engage with the substance of the question, OMIT its index from your response entirely rather than quoting a superficial or tangential sentence.
 
@@ -380,13 +391,13 @@ For each highlight, give one short, plain sentence of context on why it matters 
 
 Also give the paper two scores (0-100), your own honest estimate — these are shown to the reader as informational context only, never used to hide or rank results, so give your genuine judgment rather than avoiding extremes:
 - "relevance": how relevant this paper is to the student's question overall
-- "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the paper
+- "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the abstract
 
 Papers:
 ${numbered}
 
-Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else — "section" must be exactly one of "abstract", "methods", or "results":
-[{"index": 0, "highlights": [{"text": "exact substring from that section", "reason": "one short sentence of context", "section": "abstract"}], "relevance": 0-100, "accuracy": 0-100}]`;
+Respond with ONLY a JSON array, one object per paper index, in this exact shape, and nothing else:
+[{"index": 0, "highlights": [{"text": "exact substring from that paper's abstract", "reason": "one short sentence of context"}], "relevance": 0-100, "accuracy": 0-100}]`;
 
   const msg = await anthropic.messages.create({
     model: MODEL,
@@ -416,21 +427,13 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
       const s = byIndex.get(i);
       if (!s) return null;
       const rawHighlights = Array.isArray(s.highlights) ? s.highlights
-        : (s.highlight ? [{ text: s.highlight, reason: s.reason, section: "abstract" }] : []);
+        : (s.highlight ? [{ text: s.highlight, reason: s.reason }] : []);
       // A highlight is only kept if its quoted text is genuinely locatable
-      // in the section it claims to be from — this is what stops a
-      // fabricated or misattributed quote from ever reaching the reader.
-      const sourceTextFor = section =>
-        section === "methods" ? paper.methodsExcerpt
-        : section === "results" ? paper.resultsExcerpt
-        : paper.abstract;
+      // in the abstract — this is what stops a fabricated or
+      // misattributed quote from ever reaching the reader.
       const highlights = rawHighlights
-        .map(h => ({
-          text: h?.text,
-          reason: typeof h?.reason === "string" ? h.reason : "",
-          section: ["abstract", "methods", "results"].includes(h?.section) ? h.section : "abstract"
-        }))
-        .filter(h => h.text && sourceTextFor(h.section) && sourceTextFor(h.section).includes(h.text))
+        .map(h => ({ text: h?.text, reason: typeof h?.reason === "string" ? h.reason : "" }))
+        .filter(h => h.text && paper.abstract && paper.abstract.includes(h.text))
         .slice(0, 2);
       if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
 
@@ -520,13 +523,17 @@ async function requireAuth(req, res, next) {
 app.post("/api/checkout", async (req, res) => {
   const email = (req.body.email || "").toString().trim().toLowerCase();
   if (!email || !email.includes("@")) return res.status(400).json({ error: "Valid email required" });
-  if (!PRICE_ID) return res.status(500).json({ error: "Server not configured: missing STRIPE_PRICE_ID" });
+
+  const plan = (req.body.plan || "monthly").toString();
+  const priceId = plan === "annual" ? PRICE_ID_ANNUAL : PRICE_ID;
+  if (!priceId) return res.status(500).json({ error: `Server not configured: missing price ID for plan "${plan}"` });
 
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       customer_email: email,
-      line_items: [{ price: PRICE_ID, quantity: 1 }],
+      line_items: [{ price: priceId, quantity: 1 }],
+      subscription_data: { trial_period_days: 7 }, // card collected now, first charge after 7 days unless cancelled
       success_url: `${APP_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/?checkout=cancelled`
     });
@@ -687,37 +694,33 @@ app.get("/api/search", requireAuth, async (req, res) => {
     // picking a highlight. Failures here just fall back to abstract-only
     // for that one paper; they never break the search.
     //
-    // Throttled to 4 at a time (not all-at-once) — firing dozens of
-    // simultaneous requests at Europe PMC in one burst was found to trip
-    // its rate limiting, which broke Europe PMC results entirely for that
-    // search. A paper that already came from Europe PMC's own search
-    // already carries its pmcid, so it skips the extra DOI lookup — only
-    // OpenAlex/Semantic-Scholar-only papers need it.
-    const withFullText = await mapWithConcurrency(papers, 4, async (p) => {
-      try {
-        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
-        if (!pmcid) return p;
-        const ft = await fetchPmcFullText(pmcid);
-        return {
-          ...p, hasFullText: true,
-          pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
-          methodsExcerpt: ft.methodsExcerpt, resultsExcerpt: ft.resultsExcerpt
-        };
-      } catch {
-        return p;
-      }
-    });
-    console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} candidates`);
-
-    const highlighted = await highlightPapers(question, withFullText);
-    console.log(`[search] highlightPapers: ${withFullText.length} in -> ${highlighted.length} out`);
+    const highlighted = await highlightPapers(question, papers);
+    console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
     // Highest suitability first. Sorting (unlike the old filtering-by-score
     // approach) never drops a paper — it only changes order — so it doesn't
     // carry the failure mode that got scoring removed once already.
     const sorted = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1));
     const results = sorted.slice(0, 20);
 
-    res.json({ results, searchQuery });
+    // Full-text availability is checked only on the papers actually being
+    // shown, not the full candidate pool — this used to run before
+    // highlighting on all 36 candidates so a highlight could be drawn from
+    // Methods/Results too, but that meant checking ~16 papers that never
+    // even made it to the screen. Checking after slicing, on just these
+    // ~20, is meaningfully cheaper — the trade is that a highlight can now
+    // only come from the abstract, never Methods/Results.
+    const withFullText = await mapWithConcurrency(results, 4, async (p) => {
+      try {
+        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
+        if (!pmcid) return p;
+        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/` };
+      } catch {
+        return p;
+      }
+    });
+    console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} shown results`);
+
+    res.json({ results: withFullText, searchQuery });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Search failed", detail: err.message });
@@ -768,28 +771,31 @@ app.get("/api/critical-search", requireAuth, async (req, res) => {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
     }
 
-    const withFullText = await mapWithConcurrency(papers, 4, async (p) => {
-      try {
-        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
-        if (!pmcid) return p;
-        const ft = await fetchPmcFullText(pmcid);
-        return {
-          ...p, hasFullText: true,
-          pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
-          methodsExcerpt: ft.methodsExcerpt, resultsExcerpt: ft.resultsExcerpt
-        };
-      } catch {
-        return p;
-      }
-    });
-
-    const highlighted = await highlightPapers(question, withFullText);
-    console.log(`[critical] highlightPapers: ${withFullText.length} in -> ${highlighted.length} out`);
+    const highlighted = await highlightPapers(question, papers);
+    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
     const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
     const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 7);
     const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 7);
 
-    res.json({ supports, challenges, supportQuery, counterQuery });
+    // Same principle as /api/search: full-text availability is only
+    // checked on the papers actually being shown (up to 14 here, not the
+    // full candidate pool), and only for the "Show full paper" link — a
+    // highlight can no longer be drawn from Methods/Results, only the
+    // abstract, in exchange for real speed.
+    const checkFullText = async (list) => mapWithConcurrency(list, 4, async (p) => {
+      try {
+        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
+        if (!pmcid) return p;
+        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/` };
+      } catch {
+        return p;
+      }
+    });
+    const [supportsWithFullText, challengesWithFullText] = await Promise.all([
+      checkFullText(supports), checkFullText(challenges)
+    ]);
+
+    res.json({ supports: supportsWithFullText, challenges: challengesWithFullText, supportQuery, counterQuery });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Critical analysis failed", detail: err.message });
