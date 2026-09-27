@@ -1283,30 +1283,6 @@ app.get("/api/lexicon", requireAuth, async (req, res) => {
   }
 });
 
-// ---------- How many results would this Boolean query actually return? ----------
-// Europe PMC mirrors PubMed's full corpus, so its hitCount for a query is a
-// genuine, real-time estimate of what that same query would return on
-// PubMed itself — a single cheap request (pageSize 1, we only want the
-// count), not a real search or any content fetch.
-app.get("/api/pubmed-count", requireAuth, async (req, res) => {
-  const q = (req.query.q || "").toString().trim();
-  if (!q) return res.status(400).json({ error: "Missing query param: q" });
-
-  try {
-    const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
-    url.searchParams.set("query", q);
-    url.searchParams.set("format", "json");
-    url.searchParams.set("pageSize", "1");
-    const r = await fetchWithRetry(url);
-    if (!r.ok) throw new Error(`Europe PMC ${r.status}`);
-    const data = await r.json();
-    res.json({ count: typeof data.hitCount === "number" ? data.hitCount : null });
-  } catch (err) {
-    console.error(err);
-    res.status(502).json({ error: "Could not estimate result count", detail: err.message });
-  }
-});
-
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3787;
