@@ -1144,7 +1144,7 @@ app.post("/api/audit-essay", requireAuth, async (req, res) => {
     res.json(await auditEssayText(essayText));
   } catch (err) {
     console.error(err);
-    res.status(502).json({ error: "Citation audit failed", detail: err.message });
+    res.status(502).json({ error: "Couldn't complete the citation audit right now — try again in a moment.", detail: err.message });
   }
 });
 
@@ -1181,7 +1181,7 @@ app.post("/api/audit-essay/upload", requireAuth, upload.single("file"), async (r
     res.json({ ...result, extractedLength: essayText.length });
   } catch (err) {
     console.error(err);
-    res.status(502).json({ error: "Citation audit failed", detail: err.message });
+    res.status(502).json({ error: "Couldn't complete the citation audit right now — try again in a moment.", detail: err.message });
   }
 });
 
