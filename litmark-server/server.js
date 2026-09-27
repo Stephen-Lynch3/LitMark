@@ -875,9 +875,9 @@ async function extractCitations(essayText) {
 }
 
 async function extractCitationsFromChunk(text) {
-  const prompt = `Below is an excerpt from a student's essay (it may be a section of a longer document, with the full reference list included at the end if one exists). Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears, use it to identify the full title, first author, and year for each citation.
+  const prompt = `Below is an excerpt from a student's essay (it may be a section of a longer document, with the full reference list included at the end if one exists). Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears, use it to identify the full title, first author, year, and — if present — DOI for each citation.
 
-For each citation found, provide your best guess at the paper's title, first author's last name, and year — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it.
+For each citation found, provide your best guess at the paper's title, first author's last name, year, and DOI — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it. Leave guessDoi empty unless an actual DOI (e.g. "10.1234/abcd.5678" or a doi.org link) appears in the reference list entry itself — never guess or invent one.
 
 Text:
 """
@@ -885,7 +885,7 @@ ${text}
 """
 
 Respond with ONLY a JSON array, nothing else, in this shape:
-[{"claim": "exact claim sentence from the text", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020}]
+[{"claim": "exact claim sentence from the text", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020, "guessDoi": "10.1234/abcd.5678"}]
 
 Only extract citations that actually appear in this excerpt's own body text — ignore reference-list entries that aren't cited here.`;
 
@@ -926,7 +926,66 @@ function titleSimilarity(a, b) {
   return overlap / Math.max(wa.size, wb.size);
 }
 
-async function lookupPaper({ guessTitle, guessAuthor, guessYear }) {
+// A DOI, when the reference list actually includes one, is a definitive
+// identifier — no ambiguity, no fuzzy scoring needed. Tried as a direct,
+// exact lookup against OpenAlex first (then Semantic Scholar), before
+// ever falling back to title-similarity guessing in lookupPaper below.
+async function findByDoiDirect(doi) {
+  if (!doi) return null;
+  const clean = doi.replace(/^https?:\/\/doi\.org\//i, "").trim();
+  if (!clean) return null;
+
+  try {
+    const url = `https://api.openalex.org/works/doi:${encodeURIComponent(clean)}?mailto=${encodeURIComponent(CONTACT_EMAIL)}`;
+    const res = await fetchWithRetry(url);
+    if (res.ok) {
+      const w = await res.json();
+      if (w && w.abstract_inverted_index) {
+        const oaLink = w.open_access?.oa_url || w.primary_location?.pdf_url
+          || (w.open_access?.is_oa && w.doi ? w.doi : null);
+        return {
+          source: "OpenAlex", id: w.id, title: w.title, year: w.publication_year,
+          journal: w.primary_location?.source?.display_name || "Unknown venue",
+          authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
+          oaUrl: oaLink, isOA: !!w.open_access?.is_oa, doi: w.doi,
+          citedByCount: typeof w.cited_by_count === "number" ? w.cited_by_count : null,
+          abstract: reconstructAbstract(w.abstract_inverted_index)
+        };
+      }
+    }
+  } catch {}
+
+  try {
+    const url = `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(clean)}?fields=title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount`;
+    const headers = process.env.SEMANTIC_SCHOLAR_API_KEY ? { "x-api-key": process.env.SEMANTIC_SCHOLAR_API_KEY } : {};
+    const res = await fetchWithRetry(url, { headers });
+    if (res.ok) {
+      const p = await res.json();
+      if (p && p.abstract) {
+        return {
+          source: "Semantic Scholar", id: p.externalIds?.DOI || p.paperId, title: p.title, year: p.year,
+          journal: p.venue || "Unknown venue",
+          authors: (p.authors || []).slice(0, 4).map(a => a.name).join(", "),
+          oaUrl: p.openAccessPdf?.url || null, isOA: !!p.openAccessPdf?.url, doi: p.externalIds?.DOI,
+          citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
+          abstract: p.abstract
+        };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+async function lookupPaper({ guessTitle, guessAuthor, guessYear, guessDoi }) {
+  if (guessDoi) {
+    const direct = await findByDoiDirect(guessDoi);
+    if (direct) return direct;
+    // A DOI that didn't resolve anywhere is itself worth knowing — fall
+    // through to the fuzzy title match rather than giving up, in case the
+    // DOI was mistyped in the essay but the paper is still real.
+  }
+
   const query = [guessTitle, guessAuthor, guessYear].filter(Boolean).join(" ").trim();
   if (!query) return null;
 
