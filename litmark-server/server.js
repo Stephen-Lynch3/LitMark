@@ -45,6 +45,10 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_not_configur
 const resend = new Resend(process.env.RESEND_API_KEY || "re_not_configured_yet");
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
+if (CONTACT_EMAIL === "you@example.com") {
+  console.warn("[startup] WARNING: CONTACT_EMAIL is still the placeholder \"you@example.com\" — OpenAlex's polite pool (higher rate limits) requires a real, valid email. Set a genuine CONTACT_EMAIL on Render to fix this.");
+}
+
 // Haiku for the bulk/structured work here — extracting a quote and a short
 // line of context from an abstract doesn't need Sonnet-level reasoning,
 // and Haiku is meaningfully faster, which matters directly for how long
@@ -61,6 +65,9 @@ async function buildSearchQuery(question) {
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 60,
+    temperature: 0, // a judgment/extraction task, not creative writing — the same
+                    // question should reliably produce the same query, not a
+                    // different one each time just from default randomness
     messages: [{
       role: "user",
       content: `Turn this research question into a concise academic database search query: 4-8 of the most important keywords and phrases, optimized for literal keyword matching (not a natural sentence). Return ONLY the query string, nothing else, no quotes.\n\nQuestion: "${question}"`
@@ -78,6 +85,7 @@ async function buildCounterQuery(question) {
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 60,
+    temperature: 0,
     messages: [{
       role: "user",
       content: `A student is researching this question: "${question}"
@@ -89,6 +97,22 @@ Write a concise academic database search query (4-8 keywords/phrases, literal ke
   return raw.trim().replace(/^["']|["']$/g, "") || question;
 }
 
+// A source that fails with 429 contributes ZERO candidates for that
+// request — which is a real cause of two different problems at once: it
+// silently shrinks the candidate pool (lower yield), and it means the
+// exact same search can succeed or fail on a source essentially at
+// random between runs (inconsistent results for identical searches).
+// One short retry recovers the large majority of transient rate limits.
+async function fetchWithRetry(url, options = {}, retries = 2, delayMs = 700) {
+  let res;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    res = await fetch(url, options);
+    if (res.status !== 429 || attempt === retries) return res;
+    await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+  }
+  return res;
+}
+
 // ---------- Source 1: OpenAlex ----------
 async function searchOpenAlex(query, { requireOA = true } = {}) {
   const url = new URL("https://api.openalex.org/works");
@@ -96,14 +120,14 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
   const filters = ["has_abstract:true"];
   if (requireOA) filters.push("open_access.is_oa:true");
   url.searchParams.set("filter", filters.join(","));
-  url.searchParams.set("per-page", "20");
+  url.searchParams.set("per-page", "30");
   url.searchParams.set("select", [
     "id", "title", "publication_year", "authorships",
     "primary_location", "open_access", "abstract_inverted_index", "doi"
   ].join(","));
   url.searchParams.set("mailto", CONTACT_EMAIL);
 
-  const res = await fetch(url);
+  const res = await fetchWithRetry(url);
   if (!res.ok) throw new Error(`OpenAlex ${res.status}`);
   const data = await res.json();
 
@@ -139,14 +163,14 @@ function reconstructAbstract(inverted) {
 async function searchSemanticScholar(query, { requireOA = true } = {}) {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
-  url.searchParams.set("limit", "20");
+  url.searchParams.set("limit", "30");
   url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds");
 
   const headers = process.env.SEMANTIC_SCHOLAR_API_KEY
     ? { "x-api-key": process.env.SEMANTIC_SCHOLAR_API_KEY }
     : {};
 
-  const res = await fetch(url, { headers });
+  const res = await fetchWithRetry(url, { headers });
   if (!res.ok) throw new Error(`Semantic Scholar ${res.status}`);
   const data = await res.json();
 
@@ -175,9 +199,9 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
   url.searchParams.set("query", requireOA ? `(${query}) AND (OPEN_ACCESS:Y)` : query);
   url.searchParams.set("format", "json");
   url.searchParams.set("resultType", "core");
-  url.searchParams.set("pageSize", "20");
+  url.searchParams.set("pageSize", "30");
 
-  const res = await fetch(url);
+  const res = await fetchWithRetry(url);
   if (!res.ok) throw new Error(`Europe PMC ${res.status}`);
   const data = await res.json();
   const results = data.resultList?.result || [];
@@ -402,6 +426,8 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 3600,
+    temperature: 0, // relevance/highlight judgment, not creative writing — the
+                    // same paper set should get the same verdict every time
     messages: [{ role: "user", content: prompt }]
   });
 
@@ -863,6 +889,7 @@ Only extract citations that actually appear in this excerpt's own body text — 
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 3000,
+    temperature: 0, // extraction task — the same essay text should yield the same extracted citations every time
     messages: [{ role: "user", content: prompt }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "[]";
@@ -949,6 +976,7 @@ Does the abstract genuinely support the claim as written? Respond with ONLY JSON
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 200,
+    temperature: 0, // fidelity judgment — the same claim/abstract pair should get the same verdict every time
     messages: [{ role: "user", content: prompt }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "{}";
@@ -1123,6 +1151,7 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
   const msg = await anthropic.messages.create({
     model: MODEL,
     max_tokens: 1000,
+    temperature: 0,
     messages: [{ role: "user", content: prompt }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "{}";
@@ -1186,6 +1215,47 @@ In 1-2 short, succinct sentences, pull out — in your own words, not quoting th
     const msg = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 300,
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }]
+    });
+    const summary = msg.content.find(b => b.type === "text")?.text?.trim() || "";
+    res.json({ summary });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Summarize failed", detail: err.message });
+  }
+});
+
+// ---------- Summarise an entire folder of saved sources together ----------
+// A genuine cross-paper SYNTHESIS, not a stitched-together list of
+// individual summaries — the prompt explicitly asks Claude to reason
+// across all the saved abstracts at once (agreement, disagreement,
+// overall picture), in its own words, rather than describing each paper
+// one by one.
+app.post("/api/summarize-folder", requireAuth, async (req, res) => {
+  const question = (req.body.question || "").toString().trim();
+  const papers = Array.isArray(req.body.papers) ? req.body.papers.slice(0, 20) : [];
+  const withAbstracts = papers.filter(p => p && (p.abstract || "").toString().trim());
+  if (withAbstracts.length < 2) return res.status(400).json({ error: "Need at least two saved papers with abstracts to synthesise" });
+
+  const numbered = withAbstracts.map((p, i) =>
+    `[${i + 1}] ${(p.title || "").toString().trim()}\n${(p.abstract || "").toString().trim()}`
+  ).join("\n\n");
+
+  try {
+    const prompt = `A student is researching this question:
+"${question}"
+
+They've saved these ${withAbstracts.length} papers to this folder:
+
+${numbered}
+
+Write a short SYNTHESIS — not a list describing each paper one by one — of what these sources, taken together, actually say about the question. In your own words, never quoting the abstracts directly. Note where the sources agree, where they diverge or add different angles, and what the overall picture looks like across all of them combined. If the saved papers don't actually cover the question well as a set, say so plainly. Keep it to one tight paragraph, not an essay.`;
+
+    const msg = await anthropic.messages.create({
+      model: MODEL,
+      max_tokens: 500,
+      temperature: 0,
       messages: [{ role: "user", content: prompt }]
     });
     const summary = msg.content.find(b => b.type === "text")?.text?.trim() || "";
