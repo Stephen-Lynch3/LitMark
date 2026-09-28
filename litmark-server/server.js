@@ -36,7 +36,9 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 *
 
 const app = express();
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
-app.use(express.json());
+// Stripe signs each webhook over the exact bytes it sent, so that one route
+// must receive the raw body; every other route gets normal JSON parsing.
+app.use((req, res, next) => (req.originalUrl === "/api/stripe-webhook" ? next() : express.json()(req, res, next)));
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -80,6 +82,34 @@ const APP_URL = (process.env.APP_URL || "http://localhost:3787").replace(/\/$/, 
 const PRICE_ID = process.env.STRIPE_PRICE_ID || ""; // monthly — kept as the original name for backward compatibility
 const PRICE_ID_ANNUAL = process.env.STRIPE_PRICE_ID_ANNUAL || "";
 const FROM_EMAIL = process.env.FROM_EMAIL || "LitMark <onboarding@resend.dev>";
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || "";
+if (/resend\.dev/i.test(FROM_EMAIL)) {
+  console.warn("[startup] WARNING: FROM_EMAIL is still Resend's test address (onboarding@resend.dev). Until litmark.org is verified in Resend and FROM_EMAIL is set to an address on it (e.g. \"LitMark <hello@litmark.org>\"), Resend will only deliver to your own Resend account email, so customers will not receive login links or sign-up confirmations.");
+}
+if (!STRIPE_WEBHOOK_SECRET) {
+  console.warn("[startup] WARNING: STRIPE_WEBHOOK_SECRET is not set, so sign-up confirmation emails will NOT be sent. Add a webhook endpoint in Stripe (event: checkout.session.completed) and paste its signing secret into this variable.");
+}
+
+// The Resend library reports a rejected send (an unverified sender, a bad
+// address, a revoked key) by RETURNING an error rather than throwing one, so
+// a plain try/catch around resend.emails.send() never notices a failure: the
+// page would say "sent" while nothing arrived and nothing was logged. This
+// turns both kinds of failure into a thrown Error.
+async function sendEmail({ to, subject, html, text }) {
+  const result = await resend.emails.send({
+    from: FROM_EMAIL, to, subject, html, text,
+    ...(CONTACT_EMAIL !== "you@example.com" ? { replyTo: CONTACT_EMAIL } : {})
+  });
+  if (result && result.error) {
+    throw new Error(result.error.message || result.error.name || "Resend rejected the email");
+  }
+  return result;
+}
+function emailFailureHint(message) {
+  return /verify a domain|only send testing emails|not verified/i.test(String(message))
+    ? " -> Resend won't send from this address yet. Verify litmark.org at resend.com/domains and set FROM_EMAIL on Render to an address on it, e.g. \"LitMark <hello@litmark.org>\"."
+    : "";
+}
 
 // ---------- Turn a natural-language question into a search-engine query ----------
 async function buildSearchQuery(question) {
@@ -842,17 +872,21 @@ function validateCheckoutConsent(body) {
   return null;
 }
 
+// Whole pounds print as "£6", not "£6.00", to match the price shown on the site.
+function formatMoney(unitAmount, currency) {
+  const whole = unitAmount % 100 === 0;
+  return new Intl.NumberFormat("en-GB", {
+    style: "currency", currency: String(currency || "gbp").toUpperCase(),
+    minimumFractionDigits: whole ? 0 : 2, maximumFractionDigits: whole ? 0 : 2
+  }).format(unitAmount / 100);
+}
+
 // Plain-English renewal terms for Stripe's own payment page, built from the
 // real Stripe price so the text can never drift from what will actually be
 // charged. Returns null if the price isn't a simple fixed recurring one.
 function buildRenewalText(price, trialDays, now = new Date()) {
   if (!price || typeof price.unit_amount !== "number" || !price.recurring) return null;
-  // Whole pounds print as "£6", not "£6.00", to match the price shown on the site.
-  const whole = price.unit_amount % 100 === 0;
-  const amount = new Intl.NumberFormat("en-GB", {
-    style: "currency", currency: String(price.currency || "gbp").toUpperCase(),
-    minimumFractionDigits: whole ? 0 : 2, maximumFractionDigits: whole ? 0 : 2
-  }).format(price.unit_amount / 100);
+  const amount = formatMoney(price.unit_amount, price.currency);
   const n = price.recurring.interval_count || 1;
   const every = n === 1 ? price.recurring.interval : `${n} ${price.recurring.interval}s`;
   const end = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000)
@@ -950,6 +984,113 @@ app.get("/api/checkout/confirm", async (req, res) => {
   }
 });
 
+// ---------- Confirmation email after sign-up ----------
+// Stripe sends NO receipt when a free trial starts: nothing has been charged,
+// and Stripe doesn't email receipts for zero-value invoices. Without this, a
+// customer would get no confirmation of what they've signed up to at all. It
+// is sent from a Stripe webhook rather than from the browser's "checkout
+// success" step, so it still goes out if the customer closes the tab before
+// returning to the site, and Stripe retries the webhook if the send fails.
+const emailEsc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const ukDate = d => d.toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
+
+function buildWelcomeEmail({ price, trialEnd, trialDays, discounted, termsVersion, appUrl, contactEmail }) {
+  const hasPrice = !!(price && typeof price.unit_amount === "number" && price.recurring);
+  const amount = hasPrice ? formatMoney(price.unit_amount, price.currency) : null;
+  const interval = hasPrice ? price.recurring.interval : null;
+  const n = hasPrice ? (price.recurring.interval_count || 1) : 1;
+  const every = interval ? (n === 1 ? interval : `${n} ${interval}s`) : null;
+  const planName = interval === "year" ? "Annual" : interval === "month" ? "Monthly" : "LitMark";
+  const endText = trialEnd ? ukDate(trialEnd) : null;
+  const subject = trialEnd ? "Your LitMark free trial has started" : "Welcome to LitMark: your subscription is active";
+  const heading = trialEnd ? "Your free trial has started" : "Your subscription is active";
+
+  const facts = [["Plan", amount && every ? `${planName}: ${amount} every ${every}` : "LitMark subscription"]];
+  if (trialEnd) {
+    facts.push(["Free trial", `${trialDays} days. Your card has not been charged.`]);
+    facts.push(["First payment", `${amount || "The plan price"} on ${endText}, unless you cancel before then. After that your subscription renews automatically${every ? ` every ${every}` : ""} until you cancel.`]);
+  } else {
+    facts.push(["Renewal", `Your subscription renews automatically${every ? ` every ${every}` : ""} until you cancel.`]);
+  }
+  const paras = [];
+  if (discounted) paras.push("A promotion code has been applied to your subscription. Your first invoice will show the discounted price.");
+  paras.push(`How to cancel: you can cancel online at any time. Go to ${appUrl} and choose "Login/Sign up", enter this email address to get a login link, then open Account and choose "Manage subscription".${endText ? ` Cancel before ${endText} and you won't be charged.` : ""}`);
+  paras.push(`Logging in again: go to ${appUrl} and choose "Login/Sign up", then enter this email address. We'll email you a login link that works for 15 minutes.`);
+  paras.push(`When you signed up you confirmed you're 18 or over and agreed to our Terms of Service (version ${termsVersion}) and Privacy Policy: ${appUrl}/terms.html and ${appUrl}/privacy.html`);
+  paras.push(`Questions? Email ${contactEmail}.`);
+
+  const text = [heading, "", ...facts.map(([k, v]) => `${k}: ${v}`), "", ...paras.flatMap(x => [x, ""]), "LitMark: We find it. You write it. Nothing fake."].join("\n");
+  const linkify = s => emailEsc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#1A3FB0;">$1</a>');
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;padding:16px;">
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#14161A;line-height:1.55;font-size:15px;">
+<h1 style="font-size:22px;margin:0 0 4px;">${emailEsc(heading)}</h1>
+<p style="margin:0 0 18px;color:#6E7166;">We find it. You write it. Nothing fake.</p>
+<div style="background:#F1F0E8;border-left:4px solid #C6F135;padding:14px 16px;border-radius:8px;margin:0 0 18px;">
+${facts.map(([k, v]) => `<p style="margin:0 0 8px;"><b>${emailEsc(k)}:</b> ${emailEsc(v)}</p>`).join("\n")}
+</div>
+${paras.map(x => `<p style="margin:0 0 14px;">${linkify(x)}</p>`).join("\n")}
+</div>
+</body></html>`;
+  return { subject, html, text };
+}
+
+const webhookDeps = () => ({ stripe, sendEmail, secret: STRIPE_WEBHOOK_SECRET, appUrl: APP_URL, contactEmail: CONTACT_EMAIL, termsVersion: TERMS_VERSION, trialDays: TRIAL_DAYS });
+
+async function handleStripeWebhook(req, res, deps = webhookDeps()) {
+  const { stripe: stripeClient, sendEmail: send, secret } = deps;
+  if (!secret) {
+    console.error("[webhook] STRIPE_WEBHOOK_SECRET isn't set, so Stripe's event can't be trusted or processed.");
+    return res.status(500).send("Webhook not configured");
+  }
+  let event;
+  try {
+    event = stripeClient.webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);
+  } catch (err) {
+    console.warn("[webhook] rejected a request with a bad signature:", err.message);
+    return res.status(400).send("Bad signature");
+  }
+  if (event.type !== "checkout.session.completed") return res.json({ received: true });
+
+  const session = event.data.object;
+  if (session.mode !== "subscription" || !session.subscription) return res.json({ received: true, ignored: true });
+
+  try {
+    const sub = await stripeClient.subscriptions.retrieve(session.subscription);
+    // Stripe can deliver the same event more than once; the mark below, kept
+    // on the subscription itself, stops a second confirmation being sent.
+    if (sub.metadata && sub.metadata.confirmation_emailed === "true") return res.json({ received: true, duplicate: true });
+
+    const to = (session.customer_details && session.customer_details.email) || session.customer_email;
+    if (!to) {
+      console.warn("[webhook] a completed checkout had no email address, so no confirmation was sent");
+      return res.json({ received: true });
+    }
+    const msg = buildWelcomeEmail({
+      price: sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price,
+      trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+      trialDays: deps.trialDays,
+      discounted: !!(sub.discount || (Array.isArray(sub.discounts) && sub.discounts.length)),
+      termsVersion: deps.termsVersion,
+      appUrl: deps.appUrl,
+      contactEmail: deps.contactEmail
+    });
+    await send({ to, ...msg });
+    console.log("[webhook] sent the sign-up confirmation");
+    try {
+      await stripeClient.subscriptions.update(sub.id, { metadata: { confirmation_emailed: "true" } });
+    } catch (err) {
+      // The email HAS gone out; failing the webhook now would make Stripe
+      // retry and send a duplicate, which is worse than a missing mark.
+      console.warn("[webhook] sent the confirmation but couldn't mark it as sent:", err.message);
+    }
+    return res.json({ received: true, emailed: true });
+  } catch (err) {
+    console.error("[webhook] confirmation email failed (Stripe will retry):", err.message + emailFailureHint(err.message));
+    return res.status(500).send("Will retry");
+  }
+}
+app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), (req, res) => handleStripeWebhook(req, res));
+
 // ---------- Request a login link (existing subscribers, or an admin email) ----------
 app.post("/api/login", async (req, res) => {
   const email = (req.body.email || "").toString().trim().toLowerCase();
@@ -975,14 +1116,16 @@ app.post("/api/login", async (req, res) => {
       const magicToken = signMagicToken(email, targetId);
       const link = `${APP_URL}/?magic=${encodeURIComponent(magicToken)}`;
       try {
-        await resend.emails.send({
-          from: FROM_EMAIL,
+        await sendEmail({
           to: email,
           subject: "Your LitMark login link",
-          html: `<p>Click below to log in to LitMark. This link expires in 15 minutes.</p><p><a href="${link}">${link}</a></p>`
+          html: `<p>Click below to log in to LitMark. This link expires in 15 minutes.</p><p><a href="${link}">${link}</a></p><p style="color:#6E7166;font-size:13px;">If you didn't ask for this, you can ignore this email.</p>`,
+          text: `Log in to LitMark: ${link}\n\nThis link expires in 15 minutes. If you didn't ask for it, you can ignore this email.`
         });
       } catch (err) {
-        console.error("Email send failed:", err.message);
+        // Same response to the browser either way (so this endpoint can't be
+        // used to discover who is a customer), but the reason is logged.
+        console.error("Login email failed to send:", err.message + emailFailureHint(err.message));
       }
     }
     res.json({ sent: true });
