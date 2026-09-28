@@ -172,6 +172,44 @@ function splitFamilyInitials(raw) {
   return splitGivenFamily(s);
 }
 
+// What KIND of paper is this? Sources describe it differently ("review",
+// "JournalArticle", "Journal Article; Review", ...), so map them onto one
+// short label a student can read at a glance — a review and a single trial
+// are used very differently in an essay. The source's own tag wins; the
+// title only sharpens a generic one (an article whose title says it's a
+// systematic review), and a title that says "protocol" is flagged as such,
+// since a protocol reports no results.
+function normalizePaperType(rawList, title = "") {
+  const raw = (Array.isArray(rawList) ? rawList : [rawList]).filter(Boolean).map(s => String(s).toLowerCase()).join(" | ");
+  const t = String(title || "").toLowerCase();
+  const has = re => re.test(raw);
+  if (/\bprotocol\b/.test(t) && /(review|trial|study)/.test(t)) return "Study protocol";
+  let label = null;
+  if (has(/systematic review/)) label = "Systematic review";
+  else if (has(/meta[- ]?analy/)) label = "Meta-analysis";
+  else if (has(/randomi[sz]ed controlled trial/)) label = "Randomised controlled trial";
+  else if (has(/clinical trial/)) label = "Clinical trial";
+  else if (has(/case report/)) label = "Case report";
+  else if (has(/\breview\b/)) label = "Review";
+  else if (has(/preprint|posted[- ]content/)) label = "Preprint";
+  else if (has(/dissertation|thesis/)) label = "Thesis";
+  else if (has(/conference|proceedings/)) label = "Conference paper";
+  else if (has(/book[- ]?(chapter|section)|chapter/)) label = "Book chapter";
+  else if (has(/\bbook\b/)) label = "Book";
+  else if (has(/editorial/)) label = "Editorial";
+  else if (has(/letter|comment/)) label = "Letter or comment";
+  else if (has(/dataset/)) label = "Dataset";
+  else if (has(/report/)) label = "Report";
+  else if (has(/article|journal|research/)) label = "Research article";
+  if (!label || label === "Research article" || label === "Review") {
+    if (/systematic (literature )?review/.test(t)) return "Systematic review";
+    if (/meta[- ]?analy/.test(t)) return "Meta-analysis";
+    if (/randomi[sz]ed (controlled |clinical )?trial|randomi[sz]ed,? (double|placebo)/.test(t)) return "Randomised controlled trial";
+    if (/(scoping|narrative|literature|umbrella|integrative) review/.test(t)) return "Review";
+  }
+  return label;
+}
+
 // ---------- Source 1: OpenAlex ----------
 async function searchOpenAlex(query, { requireOA = true } = {}) {
   const url = new URL("https://api.openalex.org/works");
@@ -182,7 +220,7 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
   url.searchParams.set("per-page", "30");
   url.searchParams.set("select", [
     "id", "title", "publication_year", "authorships",
-    "primary_location", "open_access", "abstract_inverted_index", "doi", "cited_by_count"
+    "primary_location", "open_access", "abstract_inverted_index", "doi", "cited_by_count", "type", "is_retracted"
   ].join(","));
   url.searchParams.set("mailto", CONTACT_EMAIL);
 
@@ -206,6 +244,8 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
       isOA: !!w.open_access?.is_oa,
       doi: w.doi,
       citedByCount: typeof w.cited_by_count === "number" ? w.cited_by_count : null,
+      paperType: normalizePaperType([w.type], w.title),
+      retracted: !!w.is_retracted,
       abstract: reconstructAbstract(w.abstract_inverted_index)
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -226,7 +266,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
   url.searchParams.set("limit", "30");
-  url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount");
+  url.searchParams.set("fields", "title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount,publicationTypes");
 
   const headers = process.env.SEMANTIC_SCHOLAR_API_KEY
     ? { "x-api-key": process.env.SEMANTIC_SCHOLAR_API_KEY }
@@ -251,6 +291,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       isOA: !!p.openAccessPdf?.url,
       doi: p.externalIds?.DOI,
       citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
+      paperType: normalizePaperType(p.publicationTypes || [], p.title),
       abstract: p.abstract
     }));
 }
@@ -306,6 +347,11 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       pmcid: r.pmcid || null,
       doi: r.doi || null,
       citedByCount: typeof r.citedByCount === "number" ? r.citedByCount : null,
+      paperType: normalizePaperType([
+        ...(Array.isArray(r.pubTypeList?.pubType) ? r.pubTypeList.pubType : (r.pubTypeList?.pubType ? [r.pubTypeList.pubType] : [])),
+        r.pubType || "",
+        r.source === "PPR" ? "preprint" : ""
+      ], r.title),
       abstract: r.abstractText ? stripXmlTags(r.abstractText) : null
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -356,6 +402,7 @@ async function searchCORE(query, { requireOA = true } = {}) {
         isOA: true, // CORE indexes open-access content by design
         doi: w.doi || null,
         citedByCount: typeof w.citationCount === "number" ? w.citationCount : null,
+        paperType: normalizePaperType([w.documentType, ...(Array.isArray(w.types) ? w.types : [])], w.title),
         abstract: w.abstract || null
       };
     })
@@ -477,13 +524,18 @@ function requireTermMatch(papers, queries) {
 }
 
 function dedupe(papers) {
-  const seen = new Set();
-  return papers.filter(p => {
+  const kept = new Map();
+  for (const p of papers) {
     const key = (p.doi || p.title || "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 60);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+    if (!key) continue;
+    const existing = kept.get(key);
+    if (!existing) { kept.set(key, p); continue; }
+    // Same paper from another source: keep the first, but don't lose the
+    // paper type, citation count or retraction flag if only the duplicate had it.
+    for (const f of ["paperType", "citedByCount", "pmcid"]) if (existing[f] == null && p[f] != null) existing[f] = p[f];
+    if (p.retracted) existing.retracted = true;
+  }
+  return [...kept.values()];
 }
 
 // A plain slice(0, N) after concatenating sources in a fixed order silently
@@ -1245,7 +1297,9 @@ async function extractCitations(essayText) {
 async function extractCitationsFromChunk(text) {
   const prompt = `Below is an excerpt from a student's essay (it may be a section of a longer document, with the full reference list included at the end if one exists). Find every in-text citation (e.g. "(Smith, 2020)", "(Smith et al., 2020)", numbered markers like "[3]", footnotes) and the specific claim or sentence it's attached to. If a reference list/bibliography appears, use it to identify the full title, first author, year, and — if present — DOI for each citation.
 
-For each citation found, provide your best guess at the paper's title, first author's last name, year, and DOI — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it. Leave guessDoi empty unless an actual DOI (e.g. "10.1234/abcd.5678" or a doi.org link) appears in the reference list entry itself — never guess or invent one.
+For each citation found, provide your best guess at the paper's title, first author's last name, year, and DOI — from the reference list if present, otherwise inferred from context. Leave guessTitle empty if you can't confidently guess it. Leave guessDoi empty unless an actual DOI (or a doi.org link) appears in the reference list entry itself — never guess or invent one.
+
+Also give "sourceKind": "journal_article" if the reference-list entry is clearly a journal article (it names a journal, or has volume/issue/page numbers), "book" for a book or book chapter, "report_or_web" for a report, thesis, website, news item or other grey literature, or "unknown" if there is no reference-list entry to tell.
 
 Text:
 """
@@ -1253,7 +1307,7 @@ ${text}
 """
 
 Respond with ONLY a JSON array, nothing else, in this shape:
-[{"claim": "exact claim sentence from the text", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020, "guessDoi": "10.1234/abcd.5678"}]
+[{"claim": "exact claim sentence from the text", "citationText": "(Smith, 2020)", "guessTitle": "...", "guessAuthor": "Smith", "guessYear": 2020, "guessDoi": "", "sourceKind": "unknown"}]
 
 Only extract citations that actually appear in this excerpt's own body text — ignore reference-list entries that aren't cited here.`;
 
@@ -1266,11 +1320,25 @@ Only extract citations that actually appear in this excerpt's own body text — 
   const raw = msg.content.find(b => b.type === "text")?.text || "[]";
   const clean = raw.replace(/```json|```/g, "").trim();
   try {
-    return JSON.parse(clean);
+    const parsed = JSON.parse(clean);
+    return (Array.isArray(parsed) ? parsed : []).map(cit => sanitiseExtracted(cit, text));
   } catch (err) {
-    console.error("extractCitationsFromChunk: JSON parse failed:", clean.slice(0, 300));
+    // Deliberately not logging the model's output: it contains sentences
+    // lifted from the student's essay, which shouldn't end up in server logs.
+    console.error(`extractCitationsFromChunk: JSON parse failed (${clean.length} characters of output, not logged)`);
     return [];
   }
+}
+
+const SOURCE_KINDS = ["journal_article", "book", "report_or_web", "unknown"];
+// A DOI only counts if it genuinely appears in the text the student gave us —
+// otherwise a made-up or echoed DOI could get a real citation flagged as fake.
+function sanitiseExtracted(cit, text) {
+  const out = { ...cit };
+  out.sourceKind = SOURCE_KINDS.includes(out.sourceKind) ? out.sourceKind : "unknown";
+  const doi = cleanDoi(out.guessDoi);
+  out.guessDoi = doi && String(text || "").toLowerCase().includes(doi.toLowerCase()) ? doi : "";
+  return out;
 }
 
 // Look up ONE specific paper by title/author/year (different from topic
@@ -1317,6 +1385,8 @@ async function findByDoiDirect(doi) {
           authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
           oaUrl: oaLink || w.doi || null, isOA: !!w.open_access?.is_oa, doi: w.doi,
           citedByCount: typeof w.cited_by_count === "number" ? w.cited_by_count : null,
+          paperType: normalizePaperType([w.type], w.title),
+          retracted: !!w.is_retracted,
           abstract: reconstructAbstract(w.abstract_inverted_index)
         };
       }
@@ -1324,7 +1394,7 @@ async function findByDoiDirect(doi) {
   } catch {}
 
   try {
-    const url = `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(clean)}?fields=title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount`;
+    const url = `https://api.semanticscholar.org/graph/v1/paper/DOI:${encodeURIComponent(clean)}?fields=title,abstract,year,venue,authors,openAccessPdf,externalIds,citationCount,publicationTypes`;
     const headers = process.env.SEMANTIC_SCHOLAR_API_KEY ? { "x-api-key": process.env.SEMANTIC_SCHOLAR_API_KEY } : {};
     const res = await fetchWithRetry(url, { headers });
     if (res.ok) {
@@ -1336,6 +1406,7 @@ async function findByDoiDirect(doi) {
           authors: (p.authors || []).slice(0, 4).map(a => a.name).join(", "),
           oaUrl: p.openAccessPdf?.url || toDoiUrl(p.externalIds?.DOI), isOA: !!p.openAccessPdf?.url, doi: p.externalIds?.DOI,
           citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
+          paperType: normalizePaperType(p.publicationTypes || [], p.title),
           abstract: p.abstract
         };
       }
@@ -1385,42 +1456,239 @@ async function lookupPaper({ guessTitle, guessAuthor, guessYear, guessDoi }) {
   return bestScore >= 0.35 ? best : null;
 }
 
-async function verifyCitation(claim, paper) {
-  if (!paper || !paper.abstract) {
-    // Genuinely couldn't locate this source at all — an existence problem,
-    // distinct from finding it and being unable to confirm the claim.
-    return { status: "not_found", explanation: "Couldn't find this source at all — it may not be indexed, or the title/author guess was off. Worth double-checking it actually exists." };
+// ---------- Does the cited source even exist? ----------
+// The old check could only say "not found", which lumped together two very
+// different situations: a source that doesn't exist, and a real source with
+// no abstract in the databases LitMark can read (every search source here
+// needs an abstract). Telling those apart is what makes "fabricated" a claim
+// LitMark can stand behind — it is only made on evidence, never just because
+// something wasn't indexed.
+
+function cleanDoi(raw) {
+  if (!raw) return "";
+  return String(raw).trim()
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
+    .replace(/^doi:\s*/i, "")
+    .replace(/[\s.,;)\]]+$/, "");
+}
+const pathEncode = s => String(s).split("/").map(encodeURIComponent).join("/");
+
+// Is this DOI registered with the global DOI system (Crossref, DataCite and
+// the other registration agencies all resolve through it)? 'yes' | 'no' | 'unknown'.
+async function doiRegistration(doi) {
+  const d = cleanDoi(doi);
+  if (!/^10\.\d{4,9}\/\S+$/.test(d)) return "no";
+  try {
+    const res = await fetchWithRetry(`https://doi.org/api/handles/${pathEncode(d)}`, { signal: AbortSignal.timeout(8000) });
+    if (res.status === 404) return "no";
+    if (!res.ok) return "unknown";
+    const j = await res.json();
+    if (j.responseCode === 1) return "yes";
+    if (j.responseCode === 100) return "no";
+    return "unknown";
+  } catch {
+    return "unknown";
   }
-  const prompt = `An essay makes this claim, attributing it to a source:
+}
+
+function crossrefItem(it) {
+  if (!it) return null;
+  const year = it.issued?.["date-parts"]?.[0]?.[0] ?? null;
+  const authors = (it.author || []).slice(0, 4).map(a => [a.given, a.family].filter(Boolean).join(" ")).filter(Boolean).join(", ");
+  return {
+    title: (it.title || [])[0] || null,
+    year,
+    journal: (it["container-title"] || [])[0] || null,
+    authors,
+    doi: it.DOI || null,
+    url: it.DOI ? `https://doi.org/${it.DOI}` : (it.URL || null)
+  };
+}
+
+// Pure, so it can be tested: is the closest Crossref record the paper the
+// student cited? Deliberately cautious — 'found' needs a close title match
+// (or a decent one plus a matching year or author), and the grey zone in
+// between is 'ambiguous', which is never treated as proof of fabrication.
+function judgeCrossrefMatches(items, { title, author, year }) {
+  const surname = String(author || "").toLowerCase().replace(/[^a-z\s'-]/g, "").trim().split(/\s+/).pop();
+  let best = null, bestSim = 0;
+  for (const it of items) {
+    const sim = titleSimilarity(title, it.title);
+    if (sim > bestSim) { bestSim = sim; best = it; }
+  }
+  if (!best) return { status: "none" };
+  const yearOk = !!(year && best.year && Math.abs(best.year - year) <= 1);
+  const authorOk = !!(surname && best.authors && best.authors.toLowerCase().includes(surname));
+  if (bestSim >= 0.6 || (bestSim >= 0.45 && (yearOk || authorOk))) return { status: "found", item: best, similarity: bestSim };
+  if (bestSim >= 0.3) return { status: "ambiguous", item: best, similarity: bestSim };
+  return { status: "none", similarity: bestSim };
+}
+
+// Crossref holds a record for nearly every journal article, book and
+// conference paper, abstract or not — which is exactly what's needed to tell
+// "doesn't exist" from "exists but we can't read it".
+async function crossrefLookup({ doi, title, author, year }) {
+  const opts = { signal: AbortSignal.timeout(9000) };
+  try {
+    if (doi) {
+      const res = await fetchWithRetry(`https://api.crossref.org/works/${pathEncode(doi)}?mailto=${encodeURIComponent(CONTACT_EMAIL)}`, opts);
+      if (res.ok) return { status: "found", item: crossrefItem((await res.json()).message) };
+      if (res.status !== 404) return { status: "unknown" };
+      // 404 = not a Crossref DOI (it can still be registered elsewhere): fall through to a title search
+    }
+    if (!title) return { status: "none" };
+    const url = new URL("https://api.crossref.org/works");
+    url.searchParams.set("query.bibliographic", [title, author, year].filter(Boolean).join(" "));
+    url.searchParams.set("rows", "5");
+    url.searchParams.set("select", "DOI,title,author,issued,container-title,type,URL");
+    url.searchParams.set("mailto", CONTACT_EMAIL);
+    const res = await fetchWithRetry(url, opts);
+    if (!res.ok) return { status: "unknown" };
+    const items = ((await res.json()).message?.items || []).map(crossrefItem).filter(i => i && i.title);
+    return judgeCrossrefMatches(items, { title, author, year });
+  } catch {
+    return { status: "unknown" };
+  }
+}
+
+async function fullTextExcerpts(paper) {
+  try {
+    const pmcid = paper.pmcid || await findPmcMatchByDoi(paper.doi);
+    if (!pmcid) return null;
+    const ex = await fetchPmcFullText(pmcid);
+    return (ex.methodsExcerpt || ex.resultsExcerpt) ? ex : null;
+  } catch {
+    return null;
+  }
+}
+
+const searchedDatabases = () => ["OpenAlex", "Semantic Scholar", "Europe PMC", ...(process.env.CORE_API_KEY ? ["CORE"] : []), "Crossref"];
+const defaultDeps = () => ({ lookupPaper, doiRegistration, crossrefLookup, verifyCitation, fullTextExcerpts });
+
+// Works out whether the cited source exists, and if so whether there's an
+// abstract to check the claim against.
+async function resolveCitation(c, deps = defaultDeps()) {
+  const doi = cleanDoi(c.guessDoi);
+  const doiState = doi ? await deps.doiRegistration(doi) : null;
+
+  const paper = await deps.lookupPaper({ ...c, guessDoi: doi }).catch(() => null);
+  if (paper) return { paper, exists: "yes", doiState };
+
+  if (doiState === "no") return { paper: null, exists: "no", reason: "doi_unregistered", doiState };
+  if (doiState === "yes") {
+    const cr = await deps.crossrefLookup({ doi, title: c.guessTitle, author: c.guessAuthor, year: c.guessYear });
+    return { paper: null, exists: "yes_no_abstract", meta: cr.item || null, doiState };
+  }
+  if (!c.guessTitle) return { paper: null, exists: "unknown", reason: "no_details", doiState };
+
+  const cr = await deps.crossrefLookup({ title: c.guessTitle, author: c.guessAuthor, year: c.guessYear });
+  if (cr.status === "found") return { paper: null, exists: "yes_no_abstract", meta: cr.item, doiState };
+  if (cr.status === "ambiguous") return { paper: null, exists: "unknown", reason: "ambiguous", meta: cr.item, doiState };
+  if (cr.status === "none") return { paper: null, exists: "no", reason: "no_record", doiState };
+  return { paper: null, exists: "unknown", reason: "service_unavailable", doiState };
+}
+
+// "Fabricated" is only ever said when the evidence supports it: a DOI that
+// isn't registered anywhere, or a clearly journal-style reference that no
+// database — including Crossref — has any record of. A book, report or web
+// page that simply isn't indexed is "unable to verify" instead, so a real
+// source is never accused of being fake because of a gap in the databases.
+function isJournalStyle(c) {
+  const words = String(c.guessTitle || "").toLowerCase().replace(/[^a-z0-9\s]/g, "").split(/\s+/).filter(w => w.length > 3);
+  return c.sourceKind === "journal_article" && words.length >= 3 && !!(c.guessAuthor || c.guessYear);
+}
+
+function existenceVerdict(res, c, searched = searchedDatabases()) {
+  const list = `${searched.length} scholarly databases (${searched.join(", ")})`;
+  switch (res.exists) {
+    case "no":
+      if (res.reason === "doi_unregistered") {
+        return { status: "fabricated", explanation: `The DOI in this reference (${cleanDoi(c.guessDoi)}) isn't registered anywhere, and no paper matching it turned up in ${list}. This source looks made up, or the DOI is wrong.` };
+      }
+      if (isJournalStyle(c)) {
+        return { status: "fabricated", explanation: `No record of this article turned up in ${list}. It may not exist, so check it before relying on it.` };
+      }
+      return { status: "unable_to_verify", explanation: "We couldn't find this source. It may be a kind that scholarly databases don't cover well (a book, report or web page), so we can't confirm it either way." };
+    case "yes_no_abstract":
+      return { status: "unable_to_verify", explanation: `This source exists${res.meta?.title ? ` ("${res.meta.title}")` : ""}, but no abstract or full text is available to us, so we couldn't check your claim against it.` };
+    default:
+      if (res.reason === "no_details") return { status: "unable_to_verify", explanation: "This reference has no title or DOI we could look up, so there was nothing to check the claim against. Add the full reference and check again." };
+      if (res.reason === "ambiguous") return { status: "unable_to_verify", explanation: "We found something similar but couldn't be sure it's the same paper, so we didn't check your claim against it." };
+      return { status: "check_failed", explanation: "The lookup services didn't respond, so we couldn't check this one. Try again in a moment." };
+  }
+}
+
+// ---------- Is the claim faithful to the source? ----------
+const VERDICTS = ["faithful", "overstated", "misrepresented", "unable_to_verify"];
+
+function buildVerifyPrompt(claim, paper, extra = null) {
+  const excerpts = extra
+    ? `${extra.methodsExcerpt ? `\nMETHODS EXCERPT (from the full text): "${extra.methodsExcerpt}"` : ""}${extra.resultsExcerpt ? `\nRESULTS EXCERPT (from the full text): "${extra.resultsExcerpt}"` : ""}`
+    : "";
+  return `An essay makes this claim, attributing it to a source:
 CLAIM: "${claim}"
 
-Here is that source's actual abstract:
-"${paper.abstract}"
+Here is everything LitMark can read of that source:
+ABSTRACT: "${paper.abstract}"${excerpts}
 
-Does the abstract genuinely support the claim as written? Respond with ONLY JSON, nothing else:
-{"status": "faithful" | "overstated" | "misrepresented" | "unrelated", "explanation": "one short plain sentence"}
-- faithful: the claim accurately reflects what the abstract says
-- overstated: the claim goes further than the evidence supports (e.g. abstract says "may suggest", claim says "proves")
-- misrepresented: the claim says something the abstract doesn't support or actually contradicts
-- unrelated: the abstract doesn't address the claim's topic at all`;
+Does what's available genuinely support the claim as written? Respond with ONLY JSON, nothing else:
+{"status": "faithful" | "overstated" | "misrepresented" | "unable_to_verify", "explanation": "one short plain sentence"}
+- faithful: what's available clearly supports the claim as written
+- overstated: the source points the same way, but the claim says MORE than it shows: stronger certainty (e.g. the source says "may suggest", the claim says "proves"), causation from a correlation, a wider group or setting than was studied, or a bigger effect than was reported
+- misrepresented: the claim says something the source doesn't support, contradicts or reverses, or the source is about a different topic altogether (a real paper that doesn't say this)
+- unable_to_verify: the claim depends on a detail that isn't in the text available (a specific figure, method, sample size or passage that only the full paper would show), so it can be neither confirmed nor refuted. Use this ONLY when the available text genuinely lacks the detail. If it clearly supports or contradicts the claim, choose one of the other three.
+Judge only from the text above. Do not assume what the rest of the paper says.`;
+}
 
+async function verifyCitation(claim, paper, extra = null) {
+  if (!paper || !paper.abstract) {
+    return { status: "unable_to_verify", explanation: "This source has no abstract or full text available to us, so we couldn't check your claim against it." };
+  }
   const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 200,
     temperature: 0, // fidelity judgment — the same claim/abstract pair should get the same verdict every time
-    messages: [{ role: "user", content: prompt }]
+    messages: [{ role: "user", content: buildVerifyPrompt(claim, paper, extra) }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "{}";
   const clean = raw.replace(/```json|```/g, "").trim();
   try {
     const parsed = JSON.parse(clean);
-    return { status: parsed.status || "unverifiable", explanation: parsed.explanation || "" };
+    const status = parsed.status === "unrelated" ? "misrepresented" : parsed.status; // tolerate the old label
+    if (!VERDICTS.includes(status)) throw new Error("unexpected status");
+    return { status, explanation: parsed.explanation || "" };
   } catch {
-    // Found the real source (we have its abstract) but something went
-    // wrong generating a fidelity verdict this time — a technical hiccup,
-    // not an existence problem, so this stays a separate status.
-    return { status: "unverifiable", explanation: "Found the source, but couldn't generate a clear verdict this time — worth checking manually." };
+    // Found the real source (we have its abstract) but something went wrong
+    // producing a verdict this time — a technical hiccup, not a judgment.
+    return { status: "check_failed", explanation: "Found the source, but couldn't produce a clear verdict this time. Try again, or check it manually." };
   }
+}
+
+// One citation, start to finish. If the abstract alone can't settle the
+// claim, and the full text happens to be readable (open-access papers on
+// Europe PMC), read that too before giving up — so "unable to verify" means
+// the full text really wasn't available to LitMark.
+async function checkCitation(c, deps = defaultDeps()) {
+  const res = await resolveCitation(c, deps);
+  if (!res.paper) {
+    return { paper: null, meta: res.meta || null, ...existenceVerdict(res, c), checkedAgainst: null };
+  }
+  const paper = res.paper;
+  let verdict = await deps.verifyCitation(c.claim, paper);
+  let checkedAgainst = "the abstract";
+  if (verdict.status === "unable_to_verify") {
+    const ex = await deps.fullTextExcerpts(paper);
+    if (ex) {
+      const second = await deps.verifyCitation(c.claim, paper, ex);
+      if (second.status !== "check_failed") { verdict = second; checkedAgainst = "the abstract and parts of the full text"; }
+    }
+    if (verdict.status === "unable_to_verify") verdict = { ...verdict, explanation: `${verdict.explanation} Only the abstract was available to read.`.trim() };
+  }
+  const notes = [];
+  if (res.doiState === "no") notes.push("The DOI in your reference list isn't registered, so check it for typos.");
+  if (paper.retracted) notes.push("This paper has been retracted, so it shouldn't be relied on as evidence.");
+  if (notes.length) verdict = { ...verdict, explanation: `${verdict.explanation} ${notes.join(" ")}`.trim() };
+  return { paper, meta: null, ...verdict, checkedAgainst };
 }
 
 // Process citations in small concurrent batches rather than all at once —
@@ -1482,20 +1750,27 @@ async function auditEssayText(essayText) {
   }
 
   const results = await mapWithConcurrency(citations, 5, async (c) => {
-    const paper = await lookupPaper(c).catch(() => null);
-    console.log(`[audit] guessed "${c.guessTitle || '(no title)'}" (${c.guessAuthor || '?'}, ${c.guessYear || '?'}) -> matched "${paper?.title || 'NOTHING'}"${paper?.year ? ' (' + paper.year + ')' : ''}`);
-    const verdict = await verifyCitation(c.claim, paper);
+    const checked = await checkCitation(c).catch(err => {
+      console.error("[audit] a citation check failed:", err.message);
+      return { paper: null, meta: null, status: "check_failed", explanation: "Something went wrong checking this one. Try again in a moment.", checkedAgainst: null };
+    });
+    const paper = checked.paper, meta = checked.meta;
+    console.log(`[audit] guessed "${c.guessTitle || '(no title)'}" (${c.guessAuthor || '?'}, ${c.guessYear || '?'}) -> ${checked.status}${paper ? ` (matched "${paper.title}")` : meta ? ` (record exists: "${meta.title}")` : ""}`);
     return {
       claim: c.claim,
       citationText: c.citationText,
-      matchedTitle: paper?.title || null,
-      matchedUrl: paper?.oaUrl || null,
-      matchedJournal: paper?.journal || null,
-      matchedYear: paper?.year || null,
-      matchedAuthors: paper?.authors || null,
+      matchedTitle: paper?.title || meta?.title || null,
+      matchedUrl: paper?.oaUrl || meta?.url || null,
+      matchedJournal: paper?.journal || meta?.journal || null,
+      matchedYear: paper?.year || meta?.year || null,
+      matchedAuthors: paper?.authors || meta?.authors || null,
       matchedOA: paper ? !!paper.isOA : null,
       matchedCitedByCount: typeof paper?.citedByCount === "number" ? paper.citedByCount : null,
-      ...verdict
+      matchedType: paper?.paperType || null,
+      matchedRetracted: !!paper?.retracted,
+      checkedAgainst: checked.checkedAgainst,
+      status: checked.status,
+      explanation: checked.explanation
     };
   });
 
@@ -1653,6 +1928,43 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
 // Explicitly a paraphrase/summary task, not a quoting one — the prompt
 // asks for the paper's useful information in Claude's own words, tied to
 // why the student saved it, not a reproduction of the abstract.
+// Both summaries are written FOR the question the student was researching,
+// not as a general description of the paper. The prompts require the answer
+// to be tied to the question's own wording and to flag when a paper studied
+// something different (another population, an animal model, another
+// setting) since that limits how far it can be leaned on.
+function buildSummarisePrompt(question, title, abstract) {
+  const q = String(question || "").trim();
+  if (!q) {
+    return `A student has saved this paper to their sources:
+Title: ${title}
+Abstract: ${abstract}
+
+In 1-2 short sentences, in your own words (not quoting the abstract), say what the paper found or argues and what kind of evidence it is. Then add: "(No research question was saved with this paper, so this is a general summary.)"`;
+  }
+  return `A student is researching this specific question:
+"${q}"
+
+They've saved this paper to their sources:
+Title: ${title}
+Abstract: ${abstract}
+
+In 1-2 short sentences, in your own words (never quoting the abstract), say what this paper gives THEM for THAT question. Tie it directly to the question's own wording: state what the paper found or argues that bears on it, and how — whether it supports, complicates or challenges the question, or only gives background. Be specific to the question's details: if the paper studied a different population, setting, animal model or time frame from the one the question asks about, say so plainly, because that limits how far the student can lean on it. If the paper doesn't actually help answer the question, say that in one plain line rather than describing the paper generally.`;
+}
+
+function buildSynthesisPrompt(question, papers) {
+  const q = String(question || "").trim();
+  const numbered = papers.map((p, i) => `[${i + 1}] ${String(p.title || "").trim()}\n${String(p.abstract || "").trim()}`).join("\n\n");
+  return `A student is researching this specific question:
+${q ? `"${q}"` : "(no question was saved with this folder)"}
+
+They've saved these ${papers.length} papers to this folder:
+
+${numbered}
+
+Write one short paragraph that ANSWERS THE STUDENT'S QUESTION from these sources taken together — not a description of each paper. ${q ? "Open by stating what the evidence points to for that question (or that these sources can't settle it), using the question's own wording." : "Open by stating the overall picture the sources give."} Then note where the sources agree, where they diverge or add different angles, and any limits that matter for the question (for example sources that studied a different population, an animal model, or a different setting). In your own words, never quoting the abstracts. If the saved papers don't cover the question well as a set, say so plainly and say what's missing. One tight paragraph, not an essay.`;
+}
+
 app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const title = (req.body.title || "").toString().trim();
@@ -1660,14 +1972,7 @@ app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   if (!abstract) return res.status(400).json({ error: "Missing abstract" });
 
   try {
-    const prompt = `A student is researching this question:
-"${question}"
-
-They've saved this paper to their sources:
-Title: ${title}
-Abstract: ${abstract}
-
-In 1-2 short, succinct sentences, pull out — in your own words, not quoting the abstract — the single most useful piece of information in this paper for answering their question. Skip anything in the abstract that isn't relevant. If the paper turns out not to be very useful for this question after all, say so plainly in one line rather than padding out a summary.`;
+    const prompt = buildSummarisePrompt(question, title, abstract);
 
     const msg = await createMessageWithRetry({
       model: MODEL,
@@ -1695,19 +2000,8 @@ app.post("/api/summarize-folder", requireAuth, rateLimit, async (req, res) => {
   const withAbstracts = papers.filter(p => p && (p.abstract || "").toString().trim());
   if (withAbstracts.length < 2) return res.status(400).json({ error: "Need at least two saved papers with abstracts to synthesise" });
 
-  const numbered = withAbstracts.map((p, i) =>
-    `[${i + 1}] ${(p.title || "").toString().trim()}\n${(p.abstract || "").toString().trim()}`
-  ).join("\n\n");
-
   try {
-    const prompt = `A student is researching this question:
-"${question}"
-
-They've saved these ${withAbstracts.length} papers to this folder:
-
-${numbered}
-
-Write a short SYNTHESIS — not a list describing each paper one by one — of what these sources, taken together, actually say about the question. In your own words, never quoting the abstracts directly. Note where the sources agree, where they diverge or add different angles, and what the overall picture looks like across all of them combined. If the saved papers don't actually cover the question well as a set, say so plainly. Keep it to one tight paragraph, not an essay.`;
+    const prompt = buildSynthesisPrompt(question, withAbstracts);
 
     const msg = await createMessageWithRetry({
       model: MODEL,
