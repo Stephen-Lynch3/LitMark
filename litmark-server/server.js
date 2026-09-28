@@ -977,7 +977,30 @@ app.get("/api/checkout/confirm", async (req, res) => {
     const customerId = session.customer;
     const email = session.customer_details?.email || session.customer_email;
     const token = signSessionToken(email, customerId);
-    res.json({ token, email });
+
+    // Plan and trial details for the "you're all set" banner on the page.
+    // Best-effort: if this lookup fails, login still succeeds — the
+    // sign-up confirmation email (sent separately, from the webhook) has
+    // the authoritative numbers regardless of whether this succeeds.
+    let plan = null, trialEnd = null;
+    try {
+      if (session.subscription) {
+        const sub = await stripe.subscriptions.retrieve(session.subscription);
+        const price = sub.items?.data?.[0]?.price;
+        if (price && typeof price.unit_amount === "number" && price.recurring) {
+          const n = price.recurring.interval_count || 1;
+          plan = {
+            amount: formatMoney(price.unit_amount, price.currency),
+            every: n === 1 ? price.recurring.interval : `${n} ${price.recurring.interval}s`
+          };
+        }
+        trialEnd = sub.trial_end ? new Date(sub.trial_end * 1000).toISOString() : null;
+      }
+    } catch (e) {
+      console.warn("[checkout/confirm] couldn't load plan/trial details:", e.message);
+    }
+
+    res.json({ token, email, plan, trialEnd });
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Could not confirm checkout", detail: err.message });
