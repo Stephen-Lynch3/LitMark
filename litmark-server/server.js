@@ -563,6 +563,17 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
 // =====================================================================
 
 const activeSessions = new Map(); // customerId -> array of sessionIds, oldest first
+// Tracks sessions that have been evicted, rather than requiring every
+// request's session to be on a "valid" list. This matters because both
+// maps live in memory: if enforcement checked "is this session on the valid
+// list?", every server restart (each deploy, any idle spin-down) would empty
+// that list and wrongly log out every subscriber at once. Checking for
+// revocation instead means a restart can only ever forget an eviction —
+// the same fail-open limitation as the hourly rate limit — never lock a
+// legitimate user out. Entries older than the 30-day token lifetime are
+// pruned, since the token itself would have expired by then anyway.
+const revokedSessions = new Map(); // sessionId -> time revoked (ms)
+const SESSION_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_CONCURRENT_SESSIONS = 2;
 
 function signSessionToken(email, customerId) {
@@ -578,10 +589,13 @@ function signSessionToken(email, customerId) {
   const sessions = activeSessions.get(customerId) || [];
   sessions.push(sessionId);
   while (sessions.length > MAX_CONCURRENT_SESSIONS) {
-    sessions.shift(); // evict the oldest first
+    const evicted = sessions.shift(); // evict the oldest first
+    revokedSessions.set(evicted, Date.now());
     console.warn(`[session-limit] FLAGGED: ${email} logged in on a 3rd concurrent device — oldest session evicted. Possible account sharing.`);
   }
   activeSessions.set(customerId, sessions);
+  const cutoff = Date.now() - SESSION_LIFETIME_MS;
+  for (const [id, at] of revokedSessions) if (at < cutoff) revokedSessions.delete(id);
   return jwt.sign({ email, customerId, sessionId, purpose: "session" }, JWT_SECRET, { expiresIn: "30d" });
 }
 function signMagicToken(email, customerId) {
@@ -630,14 +644,12 @@ async function requireAuth(req, res, next) {
   }
   if (decoded.purpose !== "session") return res.status(401).json({ error: "Invalid token" });
 
-  // Session still valid, or was it evicted by a 3rd concurrent login?
-  // Admin accounts are exempt, same as the rate limit — this is about
-  // catching real customer sharing, not restricting your own testing.
-  if (decoded.customerId !== "admin") {
-    const sessions = activeSessions.get(decoded.customerId) || [];
-    if (!sessions.includes(decoded.sessionId)) {
-      return res.status(401).json({ error: "You've been logged out because this account signed in on a new device. If this wasn't you, someone else may be using your login." });
-    }
+  // Was this session evicted by a 3rd concurrent login? Admin accounts are
+  // exempt, same as the rate limit — this is about catching real customer
+  // sharing, not restricting your own testing. Tokens issued before session
+  // tracking existed have no sessionId at all and simply pass.
+  if (decoded.customerId !== "admin" && decoded.sessionId && revokedSessions.has(decoded.sessionId)) {
+    return res.status(401).json({ error: "You've been logged out because this account signed in on a new device. If this wasn't you, someone else may be using your login." });
   }
 
   try {
@@ -704,6 +716,7 @@ app.post("/api/checkout", async (req, res) => {
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
       subscription_data: { trial_period_days: 7 }, // card collected now, first charge after 7 days unless cancelled
+      allow_promotion_codes: true, // shows a native "Add promotion code" field on checkout — this is what makes creator codes actually usable, no custom code needed beyond this one line
       success_url: `${APP_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/?checkout=cancelled`
     });
