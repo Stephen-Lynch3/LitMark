@@ -134,6 +134,44 @@ async function fetchWithRetry(url, options = {}, retries = 2, delayMs = 700) {
   return res;
 }
 
+// A DOI landing page is where a paywalled paper's publisher page lives —
+// what a student follows to check whether their university has access.
+// Sources return DOIs both bare ("10.1234/x") and as full URLs.
+function toDoiUrl(doi) {
+  if (!doi) return null;
+  return /^https?:\/\//i.test(doi) ? doi : `https://doi.org/${doi}`;
+}
+
+// Structured author names (family / given), so a citation can be formatted
+// correctly in ANY style. The sources disagree on how they write a name —
+// "Jane Smith" (OpenAlex, Semantic Scholar), "Smith AB" (Europe PMC's author
+// string), "Smith, Jane" (many repositories, CORE) — and assuming "the last
+// word is the surname" for all of them produces wrong citations for some.
+const MAX_AUTHORS_KEPT = 8;
+
+function splitGivenFamily(raw) {
+  const s = String(raw || "").replace(/\s+/g, " ").trim().replace(/[.;]+$/, "");
+  if (!s) return null;
+  if (s.includes(",")) {
+    const i = s.indexOf(",");
+    return { family: s.slice(0, i).trim(), given: s.slice(i + 1).trim() };
+  }
+  const parts = s.split(" ");
+  if (parts.length === 1) return { family: parts[0], given: "" };
+  return { family: parts[parts.length - 1], given: parts.slice(0, -1).join(" ") };
+}
+
+// Europe PMC's plain author string writes "Smith AB": family first, initials last.
+function splitFamilyInitials(raw) {
+  const s = String(raw || "").replace(/\s+/g, " ").trim().replace(/[.;]+$/, "");
+  if (!s) return null;
+  const parts = s.split(" ");
+  if (parts.length === 1) return { family: parts[0], given: "" };
+  const last = parts[parts.length - 1];
+  if (/^[A-Z]{1,4}$/.test(last)) return { family: parts.slice(0, -1).join(" "), given: last };
+  return splitGivenFamily(s);
+}
+
 // ---------- Source 1: OpenAlex ----------
 async function searchOpenAlex(query, { requireOA = true } = {}) {
   const url = new URL("https://api.openalex.org/works");
@@ -154,7 +192,7 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
 
   return data.results.map(w => {
     const oaLink = w.open_access?.oa_url || w.primary_location?.pdf_url
-      || (w.open_access?.is_oa && w.doi ? w.doi : null); // is_oa but no direct link on file — DOI landing page as a fallback rather than dropping it
+      || ((w.open_access?.is_oa || !requireOA) && w.doi ? w.doi : null); // is_oa but no direct link on file — DOI landing page as a fallback rather than dropping it. When paywalled papers are wanted (requireOA off), the DOI page is also the right link for a paper that isn't open access.
     return {
       source: "OpenAlex",
       id: w.id,
@@ -162,6 +200,8 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
       year: w.publication_year,
       journal: w.primary_location?.source?.display_name || "Unknown venue",
       authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
+      authorList: (w.authorships || []).slice(0, MAX_AUTHORS_KEPT).map(a => splitGivenFamily(a.author?.display_name)).filter(Boolean),
+      authorTotal: (w.authorships || []).length,
       oaUrl: oaLink,
       isOA: !!w.open_access?.is_oa,
       doi: w.doi,
@@ -205,7 +245,9 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       year: p.year,
       journal: p.venue || "Unknown venue",
       authors: (p.authors || []).slice(0, 4).map(a => a.name).join(", "),
-      oaUrl: p.openAccessPdf?.url || null,
+      authorList: (p.authors || []).slice(0, MAX_AUTHORS_KEPT).map(a => splitGivenFamily(a.name)).filter(Boolean),
+      authorTotal: (p.authors || []).length,
+      oaUrl: p.openAccessPdf?.url || (!requireOA ? toDoiUrl(p.externalIds?.DOI) : null),
       isOA: !!p.openAccessPdf?.url,
       doi: p.externalIds?.DOI,
       citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
@@ -230,10 +272,25 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
   const results = data.resultList?.result || [];
 
   return results.map(r => {
+    // Prefer Europe PMC's structured author records; fall back to parsing
+    // its plain "Smith AB, Jones CD" string.
+    const epmcAuthors = r.authorList?.author;
+    let authorList, authorTotal;
+    if (Array.isArray(epmcAuthors) && epmcAuthors.length) {
+      authorList = epmcAuthors.slice(0, MAX_AUTHORS_KEPT)
+        .map(a => a.lastName ? { family: a.lastName, given: a.firstName || a.initials || "" } : splitFamilyInitials(a.fullName || a.collectiveName))
+        .filter(Boolean);
+      authorTotal = epmcAuthors.length;
+    } else {
+      const parts = (r.authorString || "").split(", ").filter(Boolean);
+      authorList = parts.slice(0, MAX_AUTHORS_KEPT).map(splitFamilyInitials).filter(Boolean);
+      authorTotal = parts.length;
+    }
     const oaLink =
       (r.fullTextUrlList?.fullTextUrl || []).find(u => (u.availability || "").toLowerCase().includes("open access"))?.url
       || (r.pmcid ? `https://pmc.ncbi.nlm.nih.gov/articles/${r.pmcid}/` : null)
-      || (r.doi ? `https://doi.org/${r.doi}` : null);
+      || (r.doi ? `https://doi.org/${r.doi}` : null)
+      || (!requireOA && r.source && r.id ? `https://europepmc.org/article/${r.source}/${r.id}` : null);
 
     return {
       source: "Europe PMC",
@@ -242,6 +299,8 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       year: r.pubYear ? parseInt(r.pubYear) : null,
       journal: r.journalTitle || "Unknown venue",
       authors: (r.authorString || "").split(", ").slice(0, 4).join(", "),
+      authorList,
+      authorTotal,
       oaUrl: oaLink,
       isOA: r.isOpenAccess === "Y",
       pmcid: r.pmcid || null,
@@ -276,6 +335,12 @@ async function searchCORE(query, { requireOA = true } = {}) {
   return (data.results || [])
     .map(w => {
       const oaLink = w.downloadUrl || (w.doi ? `https://doi.org/${w.doi}` : null);
+      // CORE returns authors as plain strings or as {name} objects depending
+      // on the record, usually written "Smith, Jane" — normalise both.
+      const rawNames = (Array.isArray(w.authors) ? w.authors : [])
+        .map(a => typeof a === "string" ? a : a?.name)
+        .filter(Boolean);
+      const coreAuthorList = rawNames.slice(0, MAX_AUTHORS_KEPT).map(splitGivenFamily).filter(Boolean);
       return {
         source: "CORE",
         id: w.coreId || w.id,
@@ -284,7 +349,9 @@ async function searchCORE(query, { requireOA = true } = {}) {
         // (yearPublished vs year) — checking both rather than betting on one.
         year: w.yearPublished || w.year || null,
         journal: (Array.isArray(w.journals) && w.journals[0]) || w.publisher || "Unknown venue",
-        authors: (Array.isArray(w.authors) ? w.authors : []).slice(0, 4).join(", "),
+        authors: coreAuthorList.slice(0, 4).map(a => a.given ? `${a.given} ${a.family}` : a.family).join(", "),
+        authorList: coreAuthorList,
+        authorTotal: rawNames.length,
         oaUrl: oaLink,
         isOA: true, // CORE indexes open-access content by design
         doi: w.doi || null,
@@ -296,6 +363,7 @@ async function searchCORE(query, { requireOA = true } = {}) {
 }
 
 
+// Given ANY paper's DOI (regardless of whether OpenAlex, Semantic Scholar,
 // or Europe PMC's own topic search originally found it), check whether
 // Europe PMC separately has it indexed with full text available. This is
 // how full-text coverage extends beyond papers Europe PMC's own search
@@ -828,6 +896,11 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
+  // Default is open-access only. With includePaywalled=1, papers that aren't
+  // free to read are included too (abstract-only, linked to the publisher
+  // page) — much of the literature in fields outside biomedicine sits
+  // behind paywalls that a student's university library unlocks.
+  const oaOpts = { requireOA: req.query.includePaywalled !== "1" };
 
   try {
     const searchQuery = await buildSearchQuery(question);
@@ -838,14 +911,14 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
     // X") rather than a specific claim. Searching the raw question too
     // and merging both pools substantially widens coverage.
     const fetches = await Promise.allSettled([
-      searchOpenAlex(searchQuery),
-      searchSemanticScholar(searchQuery),
-      searchOpenAlex(question),
-      searchSemanticScholar(question),
-      searchEuropePMC(searchQuery),
-      searchEuropePMC(question),
-      searchCORE(searchQuery),
-      searchCORE(question)
+      searchOpenAlex(searchQuery, oaOpts),
+      searchSemanticScholar(searchQuery, oaOpts),
+      searchOpenAlex(question, oaOpts),
+      searchSemanticScholar(question, oaOpts),
+      searchEuropePMC(searchQuery, oaOpts),
+      searchEuropePMC(question, oaOpts),
+      searchCORE(searchQuery, oaOpts),
+      searchCORE(question, oaOpts)
     ]);
     const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)", "CORE(query)", "CORE(raw)"];
     fetches.forEach((f, i) => {
@@ -949,6 +1022,11 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
+  // Default is open-access only. With includePaywalled=1, papers that aren't
+  // free to read are included too (abstract-only, linked to the publisher
+  // page) — much of the literature in fields outside biomedicine sits
+  // behind paywalls that a student's university library unlocks.
+  const oaOpts = { requireOA: req.query.includePaywalled !== "1" };
 
   try {
     const [supportQuery, counterQuery] = await Promise.all([
@@ -957,8 +1035,8 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     ]);
 
     const [supportFetches, counterFetches] = await Promise.all([
-      Promise.allSettled([searchOpenAlex(supportQuery), searchSemanticScholar(supportQuery), searchEuropePMC(supportQuery), searchCORE(supportQuery)]),
-      Promise.allSettled([searchOpenAlex(counterQuery), searchSemanticScholar(counterQuery), searchEuropePMC(counterQuery), searchCORE(counterQuery)])
+      Promise.allSettled([searchOpenAlex(supportQuery, oaOpts), searchSemanticScholar(supportQuery, oaOpts), searchEuropePMC(supportQuery, oaOpts), searchCORE(supportQuery, oaOpts)]),
+      Promise.allSettled([searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts), searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts)])
     ]);
     const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)"];
     [...supportFetches, ...counterFetches].forEach((f, i) => {
@@ -1154,7 +1232,7 @@ async function findByDoiDirect(doi) {
           source: "OpenAlex", id: w.id, title: w.title, year: w.publication_year,
           journal: w.primary_location?.source?.display_name || "Unknown venue",
           authors: (w.authorships || []).slice(0, 4).map(a => a.author?.display_name).filter(Boolean).join(", "),
-          oaUrl: oaLink, isOA: !!w.open_access?.is_oa, doi: w.doi,
+          oaUrl: oaLink || w.doi || null, isOA: !!w.open_access?.is_oa, doi: w.doi,
           citedByCount: typeof w.cited_by_count === "number" ? w.cited_by_count : null,
           abstract: reconstructAbstract(w.abstract_inverted_index)
         };
@@ -1173,7 +1251,7 @@ async function findByDoiDirect(doi) {
           source: "Semantic Scholar", id: p.externalIds?.DOI || p.paperId, title: p.title, year: p.year,
           journal: p.venue || "Unknown venue",
           authors: (p.authors || []).slice(0, 4).map(a => a.name).join(", "),
-          oaUrl: p.openAccessPdf?.url || null, isOA: !!p.openAccessPdf?.url, doi: p.externalIds?.DOI,
+          oaUrl: p.openAccessPdf?.url || toDoiUrl(p.externalIds?.DOI), isOA: !!p.openAccessPdf?.url, doi: p.externalIds?.DOI,
           citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
           abstract: p.abstract
         };
@@ -1356,7 +1434,7 @@ app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
-// ---------- Citation Audit: file upload (.docx / .txt) ----------
+// ---------- Citation Audit: file upload (.docx / .pdf / .txt) ----------
 // Accepts a Word doc or plain text file instead of pasted text. Extraction
 // is the one genuinely new failure mode here — .docx is a zipped bundle of
 // XML under the hood, handled by the well-established `mammoth` library
@@ -1372,12 +1450,23 @@ app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"
       essayText = value;
     } else if (name.endsWith(".txt")) {
       essayText = req.file.buffer.toString("utf-8");
+    } else if (name.endsWith(".pdf")) {
+      // Imported lazily, and from the library's inner file: pdf-parse's
+      // top-level entry runs a debug routine on import that can crash when
+      // loaded this way. Loading it only when a PDF is actually uploaded
+      // also means a problem here can't affect anything else in the app.
+      const { default: pdfParse } = await import("pdf-parse/lib/pdf-parse.js");
+      const parsed = await pdfParse(req.file.buffer);
+      essayText = parsed.text || "";
+      if (essayText.replace(/\s+/g, "").length < 200) {
+        return res.status(400).json({ error: "That PDF doesn't seem to contain readable text — it may be a scan or an image. Export a text-based PDF from Word or Google Docs, or paste the text in instead." });
+      }
     } else {
-      return res.status(400).json({ error: "Unsupported file type — please upload a .docx or .txt file" });
+      return res.status(400).json({ error: "Unsupported file type — please upload a .docx, .pdf or .txt file" });
     }
   } catch (err) {
     console.error("File extraction failed:", err.message);
-    return res.status(400).json({ error: "Couldn't read that file — it may be corrupted, password-protected, or an older .doc format (only .docx is supported)" });
+    return res.status(400).json({ error: "Couldn't read that file — it may be corrupted, password-protected, or an older .doc format (only .docx, .pdf and .txt are supported)" });
   }
 
   essayText = (essayText || "").trim();
@@ -1400,19 +1489,34 @@ app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"
 // query string, with its nested quote marks and field tags, is built
 // mechanically by this code, not generated as a single fragile JSON
 // string value (which failed on more complex questions in practice).
-async function generateLexicon(question) {
-  const prompt = `A student wants to search PubMed for literature on this research question:
+// Each database writes the same Boolean search differently. These follow each
+// interface's documented syntax: PubMed [tiab] tags; Scopus TITLE-ABS-KEY();
+// Web of Science TS=(); EBSCOhost repeats the field code per term (TI "x" OR
+// AB "x"); Ovid puts a suffix after the term (x.ti,ab.); Google Scholar has no
+// field tags at all, so a plain grouped OR/AND query is the closest thing.
+const quoteTerm = t => t.includes(" ") ? `"${t}"` : t;
+const LEXICON_DBS = {
+  pubmed:  { label: "PubMed",         join: " AND ", concept: ts => "(" + ts.map(t => `${quoteTerm(t)}[tiab]`).join(" OR ") + ")" },
+  scopus:  { label: "Scopus",         join: " AND ", concept: ts => "TITLE-ABS-KEY(" + ts.map(quoteTerm).join(" OR ") + ")" },
+  wos:     { label: "Web of Science", join: " AND ", concept: ts => "TS=(" + ts.map(quoteTerm).join(" OR ") + ")" },
+  ebsco:   { label: "EBSCOhost (PsycINFO, ERIC, CINAHL…)", join: " AND ", concept: ts => "(" + ts.flatMap(t => [`TI ${quoteTerm(t)}`, `AB ${quoteTerm(t)}`]).join(" OR ") + ")" },
+  ovid:    { label: "Ovid (MEDLINE, PsycINFO, Embase…)", join: " and ", concept: ts => "(" + ts.map(quoteTerm).join(" or ") + ").ti,ab." },
+  scholar: { label: "Google Scholar", join: " ",     concept: ts => "(" + ts.map(quoteTerm).join(" OR ") + ")" }
+};
+
+async function generateLexicon(question, db = "pubmed") {
+  const prompt = `A student wants to search academic literature databases for literature on this research question:
 "${question}"
 
-Break this down into the distinct CONCEPTS a good PubMed search needs (usually 2-4), and for each concept, list the alternative search terms that mean the same thing or are genuinely interchangeable for search purposes — the terms within one concept will be combined with OR, so only group things that are truly alternative ways of saying the same thing.
+Break this down into the distinct CONCEPTS a good database search needs (usually 2-4), and for each concept, list the alternative search terms that mean the same thing or are genuinely interchangeable for search purposes — the terms within one concept will be combined with OR, so only group things that are truly alternative ways of saying the same thing.
 
 For each concept, include, where genuinely useful for this specific question:
 - synonyms
 - alternative spellings
 - abbreviations and acronyms
 - singular/plural variants
-- gene/protein aliases
-- closely related biological terminology (e.g. ortholog/orthologue, homolog/homologue) — only when it actually fits
+- gene/protein aliases (only for biological topics)
+- closely related field-specific terminology (e.g. ortholog/orthologue in biology, or the different names a concept goes by across disciplines) — only when it actually fits
 
 Do NOT blindly treat merely related concepts as synonyms of each other — a concept's terms must be genuinely interchangeable, not just topically related.
 
@@ -1456,11 +1560,10 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
   // Build the actual Boolean query string ourselves, mechanically — no
   // risk of malformed JSON or broken syntax, since this is plain string
   // concatenation, not something an LLM had to get exactly right.
-  const query = concepts
-    .map(c => "(" + c.terms.map(t => t.includes(" ") ? `"${t}"[tiab]` : `${t}[tiab]`).join(" OR ") + ")")
-    .join(" AND ");
+  const spec = LEXICON_DBS[db] || LEXICON_DBS.pubmed;
+  const query = concepts.map(c => spec.concept(c.terms)).join(spec.join);
 
-  return { query, concepts };
+  return { query, concepts, db: LEXICON_DBS[db] ? db : "pubmed", dbLabel: spec.label };
 }
 
 // ---------- Summarise a saved source ----------
@@ -1542,7 +1645,8 @@ app.get("/api/lexicon", requireAuth, rateLimit, async (req, res) => {
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
 
   try {
-    const result = await generateLexicon(question);
+    const db = (req.query.db || "pubmed").toString();
+    const result = await generateLexicon(question, db);
     res.json(result);
   } catch (err) {
     console.error(err);
