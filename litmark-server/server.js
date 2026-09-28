@@ -112,14 +112,19 @@ async function sendEmail({ to, subject, html, text }) {
 // shown underneath in small text, for anyone whose mail app strips styled
 // buttons, or who'd rather copy it manually.
 function buildLoginLinkEmailHtml(link) {
+  // Deliberately a PLAIN inline link, not a styled button (no background,
+  // padding or rounded corners) — a styled, block-level "call to action"
+  // link is exactly the shape Apple Mail's smart-actions feature is known
+  // to sometimes intercept and try to handle itself, which is one
+  // candidate for why the earlier button version failed on Mac and iPhone
+  // Mail specifically. This version tests that theory: same short,
+  // clean link, presented as an ordinary hyperlink instead.
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;padding:16px;">
 <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#14161A;line-height:1.55;font-size:15px;">
 <h1 style="font-size:20px;margin:0 0 4px;">Log in to LitMark</h1>
 <p style="margin:0 0 22px;color:#6E7166;">We find it. You write it. Nothing fake.</p>
-<p style="margin:0 0 20px;">Click the button below to log in. This link works once, and expires in 15 minutes.</p>
-<p style="margin:0 0 24px;"><a href="${link}" style="display:inline-block;background:#14161A;color:#FDFDF9;text-decoration:none;font-weight:700;padding:12px 24px;border-radius:24px;">Log in to LitMark</a></p>
-<p style="margin:0 0 8px;color:#6E7166;font-size:13px;">If the button doesn't work, copy and paste this link into your browser:</p>
-<p style="margin:0 0 20px;word-break:break-all;font-size:13px;"><a href="${link}" style="color:#1A3FB0;">${link}</a></p>
+<p style="margin:0 0 20px;">Click the link below to log in. It works once, and expires in 15 minutes.</p>
+<p style="margin:0 0 20px;"><a href="${link}" style="color:#1A3FB0;">Log in to LitMark</a></p>
 <p style="margin:0;color:#6E7166;font-size:13px;">If you didn't ask for this, you can ignore this email.</p>
 </div>
 </body></html>`;
