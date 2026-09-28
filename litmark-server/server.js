@@ -770,24 +770,107 @@ function rateLimit(req, res, next) {
 }
 
 // ---------- Start a subscription ----------
+// ---------- Sign-up consent, and the renewal terms shown at checkout ----------
+// Minimum age to subscribe. A self-declared tick box is the standard age gate;
+// it doesn't verify anyone's age. Under-18s generally can't be bound to a paid
+// subscription, which is why this is 18 rather than the UK's age of digital
+// consent (13). Change it here, and in the Terms and Privacy Policy, together.
+const MIN_AGE = 18;
+// Which version of the Terms was in force when someone signed up. Keep this
+// equal to the "Last updated" date on the Terms page (yyyy-mm-dd).
+const TERMS_VERSION = "2026-09-28";
+const TRIAL_DAYS = 7;
+
+// The gate has to be enforced here, not just on the page — a tick box in the
+// browser alone could be skipped by anyone calling the API directly. Returns
+// an error message, or null when both confirmations were explicitly given.
+function validateCheckoutConsent(body) {
+  if (body?.ageConfirmed !== true) return `Please confirm you're ${MIN_AGE} or over to subscribe.`;
+  if (body?.termsAccepted !== true) return "Please agree to the Terms, Privacy Policy and automatic renewal to subscribe.";
+  return null;
+}
+
+// Plain-English renewal terms for Stripe's own payment page, built from the
+// real Stripe price so the text can never drift from what will actually be
+// charged. Returns null if the price isn't a simple fixed recurring one.
+function buildRenewalText(price, trialDays, now = new Date()) {
+  if (!price || typeof price.unit_amount !== "number" || !price.recurring) return null;
+  // Whole pounds print as "£6", not "£6.00", to match the price shown on the site.
+  const whole = price.unit_amount % 100 === 0;
+  const amount = new Intl.NumberFormat("en-GB", {
+    style: "currency", currency: String(price.currency || "gbp").toUpperCase(),
+    minimumFractionDigits: whole ? 0 : 2, maximumFractionDigits: whole ? 0 : 2
+  }).format(price.unit_amount / 100);
+  const n = price.recurring.interval_count || 1;
+  const every = n === 1 ? price.recurring.interval : `${n} ${price.recurring.interval}s`;
+  const end = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000)
+    .toLocaleDateString("en-GB", { day: "numeric", month: "long", year: "numeric", timeZone: "Europe/London" });
+  return `Free for ${trialDays} days, then ${amount} every ${every}. Unless you cancel before ${end}, the first payment of ${amount} is taken then (the minimum you'd pay if you don't cancel in time), and your subscription renews automatically every ${every} until you cancel. Cancel any time online from "Manage subscription" on litmark.org.`;
+}
+
+// If Stripe rejects only the optional consent/renewal-text extras (for
+// example a dashboard prerequisite isn't set), retry without them rather than
+// letting a cosmetic extra take sign-up down for everyone.
+async function createSessionWithFallback(client, params) {
+  try {
+    return await client.checkout.sessions.create(params);
+  } catch (err) {
+    if (!(err?.param && /^(custom_text|consent_collection)/.test(err.param))) throw err;
+    console.warn(`[checkout] Stripe rejected "${err.param}" — retrying without the extra consent text: ${err.message}`);
+    const { custom_text, consent_collection, ...rest } = params;
+    return await client.checkout.sessions.create(rest);
+  }
+}
+
 app.post("/api/checkout", async (req, res) => {
   const email = (req.body.email || "").toString().trim().toLowerCase();
   if (!email || !email.includes("@")) return res.status(400).json({ error: "Valid email required" });
+
+  const consentError = validateCheckoutConsent(req.body);
+  if (consentError) return res.status(400).json({ error: consentError });
 
   const plan = (req.body.plan || "monthly").toString();
   const priceId = plan === "annual" ? PRICE_ID_ANNUAL : PRICE_ID;
   if (!priceId) return res.status(500).json({ error: `Server not configured: missing price ID for plan "${plan}"` });
 
   try {
-    const session = await stripe.checkout.sessions.create({
+    // Recorded against the subscription in Stripe, so there's a timestamped
+    // record of what each customer confirmed and which Terms they agreed to.
+    const consentMeta = {
+      age_confirmed: `${MIN_AGE}+`,
+      terms_accepted_at: new Date().toISOString(),
+      terms_version: TERMS_VERSION,
+      auto_renewal_acknowledged: "true"
+    };
+
+    let renewalText = null;
+    try { renewalText = buildRenewalText(await stripe.prices.retrieve(priceId), TRIAL_DAYS); }
+    catch (e) { console.warn("[checkout] couldn't load price for renewal text:", e.message); }
+
+    const params = {
       mode: "subscription",
       customer_email: email,
       line_items: [{ price: priceId, quantity: 1 }],
-      subscription_data: { trial_period_days: 7 }, // card collected now, first charge after 7 days unless cancelled
+      metadata: consentMeta,
+      subscription_data: { trial_period_days: TRIAL_DAYS, metadata: consentMeta }, // card collected now, first charge after the trial unless cancelled
       allow_promotion_codes: true, // shows a native "Add promotion code" field on checkout — this is what makes creator codes actually usable, no custom code needed beyond this one line
       success_url: `${APP_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${APP_URL}/?checkout=cancelled`
-    });
+    };
+    // Renewal terms next to Stripe's own pay button, as well as on our page.
+    if (renewalText) params.custom_text = { submit: { message: renewalText } };
+    // Optional: an express "I agree" checkbox on Stripe's page too. Needs a
+    // Terms of Service link set in the Stripe dashboard first, so it's off
+    // unless STRIPE_COLLECT_TOS=true.
+    if (process.env.STRIPE_COLLECT_TOS === "true") {
+      params.consent_collection = { terms_of_service: "required" };
+      params.custom_text = {
+        ...(params.custom_text || {}),
+        terms_of_service_acceptance: { message: "I agree to LitMark's Terms of Service, and that my subscription renews automatically until I cancel." }
+      };
+    }
+
+    const session = await createSessionWithFallback(stripe, params);
     res.json({ url: session.url });
   } catch (err) {
     console.error(err);
