@@ -29,7 +29,7 @@ import jwt from "jsonwebtoken";
 import { Resend } from "resend";
 import multer from "multer";
 import mammoth from "mammoth";
-import { randomUUID } from "crypto";
+import { randomUUID, randomBytes } from "crypto";
 import "dotenv/config";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
@@ -105,6 +105,26 @@ async function sendEmail({ to, subject, html, text }) {
   }
   return result;
 }
+// A real button, with short human text as the clickable target rather than
+// the raw URL itself — both because that reads as a proper product rather
+// than a debug dump, and because a link this short causes none of the
+// Apple Mail trouble the old long JWT link did. The plain URL is still
+// shown underneath in small text, for anyone whose mail app strips styled
+// buttons, or who'd rather copy it manually.
+function buildLoginLinkEmailHtml(link) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;padding:16px;">
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#14161A;line-height:1.55;font-size:15px;">
+<h1 style="font-size:20px;margin:0 0 4px;">Log in to LitMark</h1>
+<p style="margin:0 0 22px;color:#6E7166;">We find it. You write it. Nothing fake.</p>
+<p style="margin:0 0 20px;">Click the button below to log in. This link works once, and expires in 15 minutes.</p>
+<p style="margin:0 0 24px;"><a href="${link}" style="display:inline-block;background:#14161A;color:#FDFDF9;text-decoration:none;font-weight:700;padding:12px 24px;border-radius:24px;">Log in to LitMark</a></p>
+<p style="margin:0 0 8px;color:#6E7166;font-size:13px;">If the button doesn't work, copy and paste this link into your browser:</p>
+<p style="margin:0 0 20px;word-break:break-all;font-size:13px;"><a href="${link}" style="color:#1A3FB0;">${link}</a></p>
+<p style="margin:0;color:#6E7166;font-size:13px;">If you didn't ask for this, you can ignore this email.</p>
+</div>
+</body></html>`;
+}
+
 function emailFailureHint(message) {
   return /verify a domain|only send testing emails|not verified/i.test(String(message))
     ? " -> Resend won't send from this address yet. Verify litmark.org at resend.com/domains and set FROM_EMAIL on Render to an address on it, e.g. \"LitMark <hello@litmark.org>\"."
@@ -748,8 +768,28 @@ function signSessionToken(email, customerId) {
   for (const [id, at] of revokedSessions) if (at < cutoff) revokedSessions.delete(id);
   return jwt.sign({ email, customerId, sessionId, purpose: "session" }, JWT_SECRET, { expiresIn: "30d" });
 }
+// The login link used to embed a full signed JWT (three dot-separated
+// base64url chunks, 150+ characters) directly in the URL. That shape —
+// long, full of dots, dashes and underscores — is exactly what trips up
+// Apple Mail's link handling on both macOS and iOS: the email would
+// render, the link would look right, but tapping it produced a broken
+// internal "x-webdoc://" reference instead of opening the page. Other
+// mail apps generally coped fine; Apple Mail's did not.
+//
+// A short opaque code sidesteps the problem rather than working around
+// Apple's bug: nothing about how a random 32-character hex string reads
+// is unusual enough to confuse anything's link parsing. The mapping from
+// code to who it's actually for lives here in memory, the same pattern
+// already used for revokedSessions below — a login link is only ever
+// useful for 15 minutes, so nothing about it needs to survive a restart.
+const MAGIC_LINK_LIFETIME_MS = 15 * 60 * 1000;
+const magicLinkCodes = new Map(); // code -> { email, customerId, expiresAt }
 function signMagicToken(email, customerId) {
-  return jwt.sign({ email, customerId, purpose: "magic" }, JWT_SECRET, { expiresIn: "15m" });
+  const code = randomBytes(16).toString("hex");
+  const cutoff = Date.now();
+  for (const [k, v] of magicLinkCodes) if (v.expiresAt < cutoff) magicLinkCodes.delete(k);
+  magicLinkCodes.set(code, { email, customerId, expiresAt: cutoff + MAGIC_LINK_LIFETIME_MS });
+  return code;
 }
 
 // Is there an active (or trialing) subscription for this Stripe customer?
@@ -1142,7 +1182,7 @@ app.post("/api/login", async (req, res) => {
         await sendEmail({
           to: email,
           subject: "Your LitMark login link",
-          html: `<p>Click below to log in to LitMark. This link expires in 15 minutes.</p><p><a href="${link}">${link}</a></p><p style="color:#6E7166;font-size:13px;">If you didn't ask for this, you can ignore this email.</p>`,
+          html: buildLoginLinkEmailHtml(link),
           text: `Log in to LitMark: ${link}\n\nThis link expires in 15 minutes. If you didn't ask for it, you can ignore this email.`
         });
       } catch (err) {
@@ -1160,19 +1200,21 @@ app.post("/api/login", async (req, res) => {
 
 // ---------- Confirm a magic link, issue a session token ----------
 app.get("/api/login/confirm", async (req, res) => {
-  const token = (req.query.token || "").toString();
-  if (!token) return res.status(400).json({ error: "Missing token" });
+  const code = (req.query.token || "").toString();
+  if (!code) return res.status(400).json({ error: "Missing token" });
 
-  let decoded;
-  try {
-    decoded = jwt.verify(token, JWT_SECRET);
-  } catch {
+  const entry = magicLinkCodes.get(code);
+  // Consumed immediately either way: a link that's already been used
+  // shouldn't work a second time just because someone clicked it twice
+  // (the old JWT version had no such limit — this is a genuine
+  // improvement, not just a side effect of the rewrite).
+  magicLinkCodes.delete(code);
+  if (!entry || entry.expiresAt < Date.now()) {
     return res.status(401).json({ error: "Link expired or invalid — request a new one" });
   }
-  if (decoded.purpose !== "magic") return res.status(401).json({ error: "Invalid token" });
 
-  const sessionToken = signSessionToken(decoded.email, decoded.customerId);
-  res.json({ token: sessionToken, email: decoded.email });
+  const sessionToken = signSessionToken(entry.email, entry.customerId);
+  res.json({ token: sessionToken, email: entry.email });
 });
 
 // ---------- Stripe-hosted billing management page ----------
