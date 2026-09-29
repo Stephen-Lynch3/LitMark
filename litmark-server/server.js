@@ -22,6 +22,7 @@
 // Requires Node 18+ (native fetch).
 
 import express from "express";
+import helmet from "helmet";
 import cors from "cors";
 import Anthropic from "@anthropic-ai/sdk";
 import Stripe from "stripe";
@@ -35,6 +36,18 @@ import "dotenv/config";
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
 const app = express();
+// Render sits in front of this app behind its own proxy, so without this,
+// every request looks like it comes from Render's internal address —
+// req.ip would be useless, and the login rate limiter below (keyed partly
+// by IP) would silently do nothing. This makes Express read the real
+// client address from the X-Forwarded-For header Render sets.
+app.set("trust proxy", 1);
+// Standard security headers (HSTS, no-sniff, frame-busting, etc.) on every
+// response. This API only ever returns JSON, never HTML, so helmet's
+// default Content-Security-Policy has nothing to actually protect here —
+// left in anyway since it's harmless, in case a route ever serves anything
+// else later.
+app.use(helmet());
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 // Stripe signs each webhook over the exact bytes it sent, so that one route
 // must receive the raw body; every other route gets normal JSON parsing.
@@ -1160,8 +1173,49 @@ async function handleStripeWebhook(req, res, deps = webhookDeps()) {
 }
 app.post("/api/stripe-webhook", express.raw({ type: "application/json" }), (req, res) => handleStripeWebhook(req, res));
 
+// ---------- Rate limiting the login endpoint itself ----------
+// requireAuth's rate limiter (above) only ever sees a request once someone
+// is ALREADY logged in. /api/login is the one route a stranger can call
+// with nothing but an email address, and every call sends a real email —
+// so without its own limit, it's a way to mail-bomb any address (repeated,
+// unwanted login-link emails) or to hammer Stripe's customer-lookup API.
+// Two separate caps, since they guard against two different things: the
+// per-email one is generous — 3 in 15 minutes covers someone who mistyped
+// or didn't get the first one — and is what actually stops one target
+// being spammed. The per-IP one is looser still, since a university's
+// public wifi can put many genuine students behind one shared address.
+const LOGIN_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LIMIT_MAX_PER_EMAIL = 3;
+const LOGIN_LIMIT_MAX_PER_IP = 15;
+const loginAttemptsByEmail = new Map(); // email -> timestamps (ms)
+const loginAttemptsByIp = new Map();    // ip -> timestamps (ms)
+function tooManyLoginAttempts(map, key, max) {
+  const now = Date.now();
+  for (const [k, ts] of map) if (!ts.some(t => now - t < LOGIN_LIMIT_WINDOW_MS)) map.delete(k);
+  const recent = (map.get(key) || []).filter(t => now - t < LOGIN_LIMIT_WINDOW_MS);
+  if (recent.length >= max) return true;
+  recent.push(now); map.set(key, recent);
+  return false;
+}
+function loginRateLimit(req, res, next) {
+  const email = (req.body.email || "").toString().trim().toLowerCase();
+  const ip = req.ip || "unknown";
+  if (email && tooManyLoginAttempts(loginAttemptsByEmail, email, LOGIN_LIMIT_MAX_PER_EMAIL)) {
+    console.warn(`[login-rate-limit] blocked: too many login requests for ${email}`);
+    // Same vague message either way — this endpoint never reveals whether
+    // an email is a real customer, and a rate-limit response shouldn't
+    // leak that distinction either.
+    return res.status(429).json({ error: "Too many login requests for this email. Please wait a few minutes and try again." });
+  }
+  if (tooManyLoginAttempts(loginAttemptsByIp, ip, LOGIN_LIMIT_MAX_PER_IP)) {
+    console.warn(`[login-rate-limit] blocked: too many login requests from ${ip}`);
+    return res.status(429).json({ error: "Too many login requests from this network. Please wait a few minutes and try again." });
+  }
+  next();
+}
+
 // ---------- Request a login link (existing subscribers, or an admin email) ----------
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", loginRateLimit, async (req, res) => {
   const email = (req.body.email || "").toString().trim().toLowerCase();
   if (!email || !email.includes("@")) return res.status(400).json({ error: "Valid email required" });
 
