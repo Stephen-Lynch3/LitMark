@@ -81,6 +81,14 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_not_configur
 const resend = new Resend(process.env.RESEND_API_KEY || "re_not_configured_yet");
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
+// OpenAlex's free daily credit allowance without a key is small and shared
+// across every student using the site — a free key (openalex.org/settings/api)
+// raises it tenfold for zero cost. Search still works without one, just on a
+// much tighter, easy-to-exhaust budget.
+const OPENALEX_API_KEY = process.env.OPENALEX_API_KEY || "";
+if (!OPENALEX_API_KEY) {
+  console.warn("[startup] WARNING: OPENALEX_API_KEY is not set. OpenAlex searches are running on a small, shared anonymous quota (roughly 100 searches/day sitewide) instead of the much larger allowance a free key provides. Get one free at https://openalex.org/settings/api and set OPENALEX_API_KEY on Render.");
+}
 if (CONTACT_EMAIL === "you@example.com") {
   console.warn("[startup] WARNING: CONTACT_EMAIL is still the placeholder \"you@example.com\" — OpenAlex's polite pool (higher rate limits) requires a real, valid email. Set a genuine CONTACT_EMAIL on Render to fix this.");
 }
@@ -292,6 +300,12 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
     "primary_location", "open_access", "abstract_inverted_index", "doi", "cited_by_count", "type", "is_retracted"
   ].join(","));
   url.searchParams.set("mailto", CONTACT_EMAIL);
+  // OpenAlex introduced a metered daily credit budget in Feb 2026; a request
+  // with no key gets a small shared allowance, a free key a much larger one.
+  // Since this endpoint (a search/list call) is the expensive kind of
+  // request, this key matters far more here than on the single-record
+  // lookup below.
+  if (OPENALEX_API_KEY) url.searchParams.set("api_key", OPENALEX_API_KEY);
 
   const res = await fetchWithRetry(url);
   if (!res.ok) throw new Error(`OpenAlex ${res.status}`);
@@ -1659,7 +1673,7 @@ async function findByDoiDirect(doi) {
   if (!clean) return null;
 
   try {
-    const url = `https://api.openalex.org/works/doi:${encodeURIComponent(clean)}?mailto=${encodeURIComponent(CONTACT_EMAIL)}`;
+    const url = `https://api.openalex.org/works/doi:${encodeURIComponent(clean)}?mailto=${encodeURIComponent(CONTACT_EMAIL)}${OPENALEX_API_KEY ? `&api_key=${encodeURIComponent(OPENALEX_API_KEY)}` : ""}`;
     const res = await fetchWithRetry(url);
     if (res.ok) {
       const w = await res.json();
