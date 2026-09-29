@@ -960,8 +960,17 @@ async function createSessionWithFallback(client, params) {
   try {
     return await client.checkout.sessions.create(params);
   } catch (err) {
-    if (!(err?.param && /^(custom_text|consent_collection)/.test(err.param))) throw err;
-    console.warn(`[checkout] Stripe rejected "${err.param}" — retrying without the extra consent text: ${err.message}`);
+    // Two different shapes of the same underlying problem: Stripe sometimes
+    // names the offending field directly (err.param), but for at least one
+    // real case — an account with "Managed Payments" enabled by default,
+    // which is flatly incompatible with custom_text — it instead returns no
+    // param at all and only explains itself in the message text. Checking
+    // both means either shape falls back the same way: retry once without
+    // the optional extras rather than fail the whole sign-up over them.
+    const rejectsCustomText = (err?.param && /^(custom_text|consent_collection)/.test(err.param))
+      || /custom_text cannot be used/i.test(err?.message || err?.raw?.message || "");
+    if (!rejectsCustomText) throw err;
+    console.warn(`[checkout] Stripe rejected the optional consent/renewal text — retrying without it: ${err.message}`);
     const { custom_text, consent_collection, ...rest } = params;
     return await client.checkout.sessions.create(rest);
   }
