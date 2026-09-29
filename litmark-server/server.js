@@ -1009,7 +1009,17 @@ app.post("/api/checkout", async (req, res) => {
       subscription_data: { trial_period_days: TRIAL_DAYS, metadata: consentMeta }, // card collected now, first charge after the trial unless cancelled
       allow_promotion_codes: true, // shows a native "Add promotion code" field on checkout — this is what makes creator codes actually usable, no custom code needed beyond this one line
       success_url: `${APP_URL}/?checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${APP_URL}/?checkout=cancelled`
+      cancel_url: `${APP_URL}/?checkout=cancelled`,
+      // This account has Stripe's "Managed Payments" turned on by default —
+      // a bigger merchant-of-record product, not something LitMark's own
+      // Stripe integration was ever built around. Left on, it rejected
+      // custom_text outright, and once that was worked around, rejected the
+      // whole session again because Managed Payments separately requires a
+      // tax code on the product, which these products don't have. Rather
+      // than patch around each new requirement it surfaces, this switches
+      // it off for LitMark's sessions specifically — the subscription,
+      // trial and billing-portal flow are unaffected either way.
+      managed_payments: { enabled: false }
     };
     // Renewal terms next to Stripe's own pay button, as well as on our page.
     if (renewalText) params.custom_text = { submit: { message: renewalText } };
