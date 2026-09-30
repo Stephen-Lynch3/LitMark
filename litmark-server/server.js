@@ -2266,6 +2266,19 @@ ${numbered}
 Write one short paragraph that ANSWERS THE STUDENT'S QUESTION from these sources taken together — not a description of each paper. ${q ? "Open by stating what the evidence points to for that question (or that these sources can't settle it), using the question's own wording." : "Open by stating the overall picture the sources give."} Then note where the sources agree, where they diverge or add different angles, and any limits that matter for the question (for example sources that studied a different population, an animal model, or a different setting). In your own words, never quoting the abstracts. If the saved papers don't cover the question well as a set, say so plainly and say what's missing. One tight paragraph, not an essay.`;
 }
 
+// Deliberately separate from buildSummarisePrompt above: that one is about
+// relevance to the student's specific question; this one is about the
+// abstract itself being hard to follow, regardless of the question — dense
+// field-specific language, unfamiliar terms, jargon. A student can want
+// either one, or both, for the same paper.
+function buildExplainPrompt(title, abstract) {
+  return `A student has saved this paper, but the abstract is written in dense academic language they're finding hard to follow:
+Title: ${title}
+Abstract: ${abstract}
+
+Explain in plain, everyday English what this paper actually found or argues — as if to someone with no background in this field. Avoid jargon entirely where you can; where a technical term genuinely can't be avoided, briefly say what it means in plain words right there. In your own words, never quoting the abstract directly. 2-4 sentences.`;
+}
+
 app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const title = (req.body.title || "").toString().trim();
@@ -2286,6 +2299,27 @@ app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Summarize failed", detail: err.message });
+  }
+});
+
+app.post("/api/explain-source", requireAuth, rateLimit, async (req, res) => {
+  const title = (req.body.title || "").toString().trim();
+  const abstract = (req.body.abstract || "").toString().trim();
+  if (!abstract) return res.status(400).json({ error: "Missing abstract" });
+
+  try {
+    const prompt = buildExplainPrompt(title, abstract);
+    const msg = await createMessageWithRetry({
+      model: MODEL,
+      max_tokens: 300,
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }]
+    });
+    const explanation = msg.content.find(b => b.type === "text")?.text?.trim() || "";
+    res.json({ explanation });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Explain failed", detail: err.message });
   }
 });
 
