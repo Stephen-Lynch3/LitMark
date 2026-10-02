@@ -1868,9 +1868,39 @@ const defaultDeps = () => ({ lookupPaper, doiRegistration, crossrefLookup, verif
 
 // Works out whether the cited source exists, and if so whether there's an
 // abstract to check the claim against.
-async function resolveCitation(c, deps = defaultDeps()) {
+// Matches a citation against a student's own folder before ever reaching
+// out to an external database — the folder's papers are already confirmed
+// real, with an abstract already fetched, so a match here is both faster
+// (no network round trip) and more precise (there's no "which paper did
+// the search actually mean" ambiguity). Same scoring convention as
+// lookupPaper's own matching below, so the confidence bar is identical
+// either way, not looser just because it's a folder.
+function matchFolderPaper(c, folderPapers) {
+  if (!Array.isArray(folderPapers) || folderPapers.length === 0 || !c.guessTitle) return null;
+  let best = null, bestScore = 0;
+  for (const p of folderPapers) {
+    if (!p || !p.title) continue;
+    let score = titleSimilarity(c.guessTitle, p.title);
+    if (c.guessYear && Number(p.year) === Number(c.guessYear)) score += 0.15;
+    if (score > bestScore) { bestScore = score; best = p; }
+  }
+  if (bestScore < 0.35) return null;
+  // Normalise to the same shape lookupPaper's results already have, so
+  // every downstream step (verifyCitation, fullTextExcerpts, the result
+  // fields sent to the frontend) works identically either way.
+  return {
+    title: best.title, authors: best.authors, year: best.year, journal: best.journal,
+    abstract: best.abstract || "", oaUrl: best.url || null, isOA: !!best.isOA,
+    paperType: best.paperType || null, retracted: !!best.retracted, citedByCount: null
+  };
+}
+
+async function resolveCitation(c, deps = defaultDeps(), folderPapers = null) {
   const doi = cleanDoi(c.guessDoi);
   const doiState = doi ? await deps.doiRegistration(doi) : null;
+
+  const folderMatch = matchFolderPaper(c, folderPapers);
+  if (folderMatch) return { paper: folderMatch, exists: "yes", doiState, fromFolder: true };
 
   const paper = await deps.lookupPaper({ ...c, guessDoi: doi }).catch(() => null);
   if (paper) return { paper, exists: "yes", doiState };
@@ -1969,19 +1999,22 @@ async function verifyCitation(claim, paper, extra = null) {
 // claim, and the full text happens to be readable (open-access papers on
 // Europe PMC), read that too before giving up — so "unable to verify" means
 // the full text really wasn't available to LitMark.
-async function checkCitation(c, deps = defaultDeps()) {
-  const res = await resolveCitation(c, deps);
+async function checkCitation(c, deps = defaultDeps(), folderPapers = null) {
+  const res = await resolveCitation(c, deps, folderPapers);
   if (!res.paper) {
-    return { paper: null, meta: res.meta || null, ...existenceVerdict(res, c), checkedAgainst: null };
+    return { paper: null, meta: res.meta || null, ...existenceVerdict(res, c), checkedAgainst: null, fromFolder: false };
   }
   const paper = res.paper;
   let verdict = await deps.verifyCitation(c.claim, paper);
-  let checkedAgainst = "the abstract";
+  let checkedAgainst = res.fromFolder ? "the saved copy in your folder" : "the abstract";
   if (verdict.status === "unable_to_verify") {
     const ex = await deps.fullTextExcerpts(paper);
     if (ex) {
       const second = await deps.verifyCitation(c.claim, paper, ex);
-      if (second.status !== "check_failed") { verdict = second; checkedAgainst = "the abstract and parts of the full text"; }
+      if (second.status !== "check_failed") {
+        verdict = second;
+        checkedAgainst = res.fromFolder ? "the saved copy in your folder, and parts of the full text" : "the abstract and parts of the full text";
+      }
     }
     if (verdict.status === "unable_to_verify") verdict = { ...verdict, explanation: `${verdict.explanation} Only the abstract was available to read.`.trim() };
   }
@@ -1989,7 +2022,7 @@ async function checkCitation(c, deps = defaultDeps()) {
   if (res.doiState === "no") notes.push("The DOI in your reference list isn't registered, so check it for typos.");
   if (paper.retracted) notes.push("This paper has been retracted, so it shouldn't be relied on as evidence.");
   if (notes.length) verdict = { ...verdict, explanation: `${verdict.explanation} ${notes.join(" ")}`.trim() };
-  return { paper, meta: null, ...verdict, checkedAgainst };
+  return { paper, meta: null, ...verdict, checkedAgainst, fromFolder: !!res.fromFolder };
 }
 
 // Process citations in small concurrent batches rather than all at once —
@@ -2042,21 +2075,21 @@ function analyzeBibliography(results) {
 
 // Shared by both the paste route and the file-upload route — everything
 // after "we have plain essay text" is identical either way.
-async function auditEssayText(essayText) {
+async function auditEssayText(essayText, folderPapers = null) {
   const citations = await extractCitations(essayText);
-  console.log(`[audit] extracted ${citations.length} citations`);
+  console.log(`[audit] extracted ${citations.length} citations${folderPapers ? `, matching against ${folderPapers.length} folder source(s) first` : ""}`);
 
   if (citations.length === 0) {
     return { results: [], warning: "No in-text citations were found in this text." };
   }
 
   const results = await mapWithConcurrency(citations, 5, async (c) => {
-    const checked = await checkCitation(c).catch(err => {
+    const checked = await checkCitation(c, undefined, folderPapers).catch(err => {
       console.error("[audit] a citation check failed:", err.message);
-      return { paper: null, meta: null, status: "check_failed", explanation: "Something went wrong checking this one. Try again in a moment.", checkedAgainst: null };
+      return { paper: null, meta: null, status: "check_failed", explanation: "Something went wrong checking this one. Try again in a moment.", checkedAgainst: null, fromFolder: false };
     });
     const paper = checked.paper, meta = checked.meta;
-    console.log(`[audit] guessed "${c.guessTitle || '(no title)'}" (${c.guessAuthor || '?'}, ${c.guessYear || '?'}) -> ${checked.status}${paper ? ` (matched "${paper.title}")` : meta ? ` (record exists: "${meta.title}")` : ""}`);
+    console.log(`[audit] guessed "${c.guessTitle || '(no title)'}" (${c.guessAuthor || '?'}, ${c.guessYear || '?'}) -> ${checked.status}${paper ? ` (matched "${paper.title}"${checked.fromFolder ? ", from folder" : ""})` : meta ? ` (record exists: "${meta.title}")` : ""}`);
     return {
       claim: c.claim,
       citationText: c.citationText,
@@ -2069,6 +2102,7 @@ async function auditEssayText(essayText) {
       matchedCitedByCount: typeof paper?.citedByCount === "number" ? paper.citedByCount : null,
       matchedType: paper?.paperType || null,
       matchedRetracted: !!paper?.retracted,
+      matchedFromFolder: !!checked.fromFolder,
       checkedAgainst: checked.checkedAgainst,
       status: checked.status,
       explanation: checked.explanation
@@ -2080,13 +2114,35 @@ async function auditEssayText(essayText) {
   return { results, bibliography };
 }
 
+// The student's own browser sends these straight from a folder already in
+// their account, so this is trusted-ish data, not a stranger's input — but
+// it's still a request body, so still capped and trimmed rather than
+// trusted blindly. Max 200 sources (no real folder gets anywhere close)
+// and generous but bounded field lengths.
+function sanitizeFolderPapers(raw) {
+  if (!Array.isArray(raw)) return null;
+  const cleaned = raw.slice(0, 200).map(p => ({
+    title: (p?.title || "").toString().slice(0, 500),
+    authors: (p?.authors || "").toString().slice(0, 500),
+    year: Number.isFinite(Number(p?.year)) ? Number(p.year) : null,
+    journal: (p?.journal || "").toString().slice(0, 300),
+    abstract: (p?.abstract || "").toString().slice(0, 5000),
+    url: (p?.url || "").toString().slice(0, 500),
+    isOA: !!p?.isOA,
+    paperType: p?.paperType ? p.paperType.toString().slice(0, 100) : null,
+    retracted: !!p?.retracted
+  })).filter(p => p.title && p.abstract);
+  return cleaned.length ? cleaned : null;
+}
+
 app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
   const essayText = (req.body.essay || "").toString().trim();
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
   if (essayText.length > 100000) return res.status(400).json({ error: "Essay too long — 100,000 characters max (around 15,000 words)" });
+  const folderPapers = sanitizeFolderPapers(req.body.folderPapers);
 
   try {
-    res.json(await auditEssayText(essayText));
+    res.json(await auditEssayText(essayText, folderPapers));
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Couldn't complete the citation audit right now — try again in a moment.", detail: err.message });
@@ -2132,8 +2188,17 @@ app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"
   if (!essayText) return res.status(400).json({ error: "That file appears to be empty" });
   if (essayText.length > 100000) return res.status(400).json({ error: "That essay is too long — 100,000 characters max (around 15,000 words)" });
 
+  // Multipart form fields (alongside the uploaded file) arrive as plain
+  // strings, not parsed JSON, so this one needs its own parse — with a
+  // fallback to "no folder selected" rather than a 400, since a malformed
+  // value here shouldn't block the actual essay check the student asked for.
+  let folderPapers = null;
+  if (req.body.folderPapers) {
+    try { folderPapers = sanitizeFolderPapers(JSON.parse(req.body.folderPapers)); } catch { folderPapers = null; }
+  }
+
   try {
-    const result = await auditEssayText(essayText);
+    const result = await auditEssayText(essayText, folderPapers);
     res.json({ ...result, extractedLength: essayText.length });
   } catch (err) {
     console.error(err);
