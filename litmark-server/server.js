@@ -492,6 +492,161 @@ async function searchCORE(query, { requireOA = true } = {}) {
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
 }
 
+// DOAJ (Directory of Open Access Journals) — added specifically to broaden
+// coverage beyond the other four sources' science lean (Europe PMC is
+// biomedical by design; OpenAlex, Semantic Scholar and CORE are genuinely
+// multidisciplinary but still skew STEM in practice). DOAJ indexes 20,000+
+// peer-reviewed OA journals across every discipline, arts and humanities
+// included, with a free, keyless public API — no setup needed, unlike CORE.
+// Every DOAJ-indexed article is open access by definition, so requireOA
+// never actually excludes anything here the way it can for other sources.
+async function searchDOAJ(query, { requireOA = true } = {}) {
+  const url = new URL(`https://doaj.org/api/search/articles/${encodeURIComponent(query)}`);
+  url.searchParams.set("pageSize", "30");
+
+  const res = await fetchWithRetry(url);
+  if (!res.ok) throw new Error(`DOAJ ${res.status}`);
+  const data = await res.json();
+
+  return (data.results || [])
+    .map(r => {
+      const bib = r.bibjson || {};
+      const rawNames = (Array.isArray(bib.author) ? bib.author : [])
+        .map(a => a?.name)
+        .filter(Boolean);
+      const doajAuthorList = rawNames.slice(0, MAX_AUTHORS_KEPT).map(splitGivenFamily).filter(Boolean);
+      const links = Array.isArray(bib.link) ? bib.link : [];
+      const fulltextLink = links.find(l => l.type === "fulltext") || links[0] || null;
+      const doiEntry = (Array.isArray(bib.identifier) ? bib.identifier : []).find(i => i.type === "doi");
+      return {
+        source: "DOAJ",
+        id: r.id,
+        title: bib.title,
+        year: bib.year || null,
+        journal: bib.journal?.title || "Unknown venue",
+        authors: doajAuthorList.slice(0, 4).map(a => a.given ? `${a.given} ${a.family}` : a.family).join(", "),
+        authorList: doajAuthorList,
+        authorTotal: rawNames.length,
+        oaUrl: fulltextLink?.url || (doiEntry ? `https://doi.org/${doiEntry.id}` : null),
+        isOA: true, // DOAJ only indexes fully open-access journals, by definition
+        doi: doiEntry?.id || null,
+        citedByCount: null, // DOAJ's metadata doesn't include citation counts
+        paperType: normalizePaperType([], bib.title),
+        abstract: bib.abstract || null
+      };
+    })
+    .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+}
+
+// Crossref — the DOI registration agency itself, not a search engine built
+// on top of one. Added specifically because, unlike every other source
+// here, it is NOT limited to open-access content: publishers register a
+// DOI with Crossref regardless of whether the work ends up paywalled. That
+// makes it the strongest option for the citation checker's "does this
+// paper genuinely exist" question — a citation to a real but paywalled
+// journal can now be confirmed real, rather than landing in "unable to
+// verify" purely because nothing OA-indexed matched it. Free, public,
+// keyless API, ~180 million records.
+//
+// Because Crossref can't reliably tell us whether a given record is
+// actually free to read (a link existing doesn't mean it's unpaywalled),
+// oaUrl is only set when requireOA is false — otherwise this source
+// correctly contributes nothing to an open-access-only search, the same
+// way any source would if it had no OA content to offer.
+async function searchCrossref(query, { requireOA = true } = {}) {
+  const url = new URL("https://api.crossref.org/works");
+  url.searchParams.set("query", query);
+  url.searchParams.set("rows", "30");
+  url.searchParams.set("mailto", CONTACT_EMAIL); // joins Crossref's faster "polite pool"
+
+  const res = await fetchWithRetry(url);
+  if (!res.ok) throw new Error(`Crossref ${res.status}`);
+  const data = await res.json();
+  const items = data.message?.items || [];
+
+  return items
+    .map(w => {
+      const rawNames = (Array.isArray(w.author) ? w.author : [])
+        .map(a => [a.given, a.family].filter(Boolean).join(" ") || a.name)
+        .filter(Boolean);
+      const crossrefAuthorList = rawNames.slice(0, MAX_AUTHORS_KEPT).map(splitGivenFamily).filter(Boolean);
+      const year = w["published"]?.["date-parts"]?.[0]?.[0]
+        || w["published-print"]?.["date-parts"]?.[0]?.[0]
+        || w["published-online"]?.["date-parts"]?.[0]?.[0]
+        || null;
+      const fulltextLink = (Array.isArray(w.link) ? w.link : []).find(l => l["content-type"] === "text/html" || l["content-type"] === "application/pdf");
+      // A plain abstract field sometimes carries JATS XML tags verbatim —
+      // strip them rather than show a student raw markup.
+      const cleanAbstract = w.abstract ? w.abstract.replace(/<[^>]+>/g, "").trim() : null;
+      return {
+        source: "Crossref",
+        id: w.DOI,
+        title: Array.isArray(w.title) ? w.title[0] : w.title,
+        year,
+        journal: (Array.isArray(w["container-title"]) && w["container-title"][0]) || w.publisher || "Unknown venue",
+        authors: crossrefAuthorList.slice(0, 4).map(a => a.given ? `${a.given} ${a.family}` : a.family).join(", "),
+        authorList: crossrefAuthorList,
+        authorTotal: rawNames.length,
+        oaUrl: requireOA ? null : (fulltextLink?.URL || (w.DOI ? `https://doi.org/${w.DOI}` : null)),
+        isOA: false, // Crossref doesn't reliably say — never claimed open access by default
+        doi: w.DOI || null,
+        citedByCount: typeof w["is-referenced-by-count"] === "number" ? w["is-referenced-by-count"] : null,
+        paperType: normalizePaperType([w.type], Array.isArray(w.title) ? w.title[0] : w.title),
+        abstract: cleanAbstract
+      };
+    })
+    .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+}
+
+// ERIC (Education Resources Information Center) — the US Department of
+// Education's own free database of education research, added because
+// education is a real, distinct gap none of the other sources specialise
+// in. Free, public, keyless API, ~2 million records. Note: the schema for
+// title/author/abstract/url below is confirmed directly; year, journal and
+// a stable per-record id are mapped from the field names ERIC's own
+// documentation and Solr-based API conventions indicate, but have not been
+// checked against a live response the way every other source here has —
+// worth a quick look at the Render logs after this first deploys, to
+// confirm those three map as expected.
+async function searchERIC(query, { requireOA = true } = {}) {
+  const url = new URL("https://api.ies.ed.gov/eric/");
+  url.searchParams.set("search", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("rows", "30");
+
+  const res = await fetchWithRetry(url);
+  if (!res.ok) throw new Error(`ERIC ${res.status}`);
+  const data = await res.json();
+  const docs = data.response?.docs || [];
+
+  return docs
+    .map(d => {
+      const rawNames = (Array.isArray(d.author) ? d.author : []).filter(Boolean);
+      const ericAuthorList = rawNames.slice(0, MAX_AUTHORS_KEPT).map(splitGivenFamily).filter(Boolean);
+      // ERIC hosts a genuine free PDF directly for a large share of its
+      // own records (especially ED-numbered grey literature) — fulltextauth
+      // / url fields vary by record, so check both before falling back.
+      const fulltextUrl = d.fulltextauth || d.url || null;
+      return {
+        source: "ERIC",
+        id: d.id || d.ericid,
+        title: d.title,
+        year: d.publicationdateyear || null,
+        journal: d.source || d.publicationtype?.[0] || "Unknown venue",
+        authors: ericAuthorList.slice(0, 4).map(a => a.given ? `${a.given} ${a.family}` : a.family).join(", "),
+        authorList: ericAuthorList,
+        authorTotal: rawNames.length,
+        oaUrl: fulltextUrl,
+        isOA: !!fulltextUrl,
+        doi: d.doi || null,
+        citedByCount: null, // ERIC's metadata doesn't include citation counts
+        paperType: normalizePaperType(Array.isArray(d.publicationtype) ? d.publicationtype : [d.publicationtype], d.title),
+        abstract: d.description || null
+      };
+    })
+    .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+}
+
 
 // Given ANY paper's DOI (regardless of whether OpenAlex, Semantic Scholar,
 // or Europe PMC's own topic search originally found it), check whether
@@ -561,49 +716,22 @@ async function fetchPmcFullText(pmcid) {
 }
 
 
-// Complementary to Claude's substance judgment — this is a cheap, literal
-// check applied BEFORE anything reaches Claude: does at least one real
-// keyword from the query actually occur in the abstract text? Filters out
-// candidates a search engine's own fuzzy ranking pulled in loosely.
-const STOPWORDS = new Set(["and","or","not","the","for","with","from","that","this","into","about","using","use","uses","of","in","on","to","a","an"]);
-function extractKeyTerms(query) {
-  return [...new Set(
-    query.toLowerCase()
-      .replace(/\bAND\b|\bOR\b|\bNOT\b/gi, " ")
-      .split(/[^a-z0-9]+/)
-      .filter(w => w.length >= 4 && !STOPWORDS.has(w))
-  )];
-}
 function requireTermMatch(papers, queries) {
-  const allTerms = [...new Set(queries.flatMap(extractKeyTerms))];
-  if (allTerms.length === 0) return papers;
-
-  // A distinctive identifier (contains both a letter and a digit — typical
-  // of gene/protein/chemical names like "gstz1" or "cyp2a6") is far more
-  // specific than a generic accompanying word like "gene" or "deletion".
-  // Requiring only ANY term to match let through many genuinely unrelated
-  // papers that happened to share common vocabulary but were never
-  // actually about the specific thing being searched for — Claude's own
-  // highlighting step then correctly rejected them, but only after
-  // wasting real cost on a candidate pool that was mostly noise. When a
-  // distinctive identifier is present, require IT specifically.
-  const distinctiveTerms = allTerms.filter(t => /[a-z]/.test(t) && /[0-9]/.test(t));
-  const requiredTerms = distinctiveTerms.length > 0 ? distinctiveTerms : allTerms;
-
-  return papers.filter(p => {
-    // Europe PMC's own search already applied this exact query server-side
-    // (with OPEN_ACCESS:Y) before ever returning a result, so its relevance
-    // ranking can be trusted as-is. Re-checking for a literal keyword
-    // substring in the returned abstract was found to wrongly reject the
-    // large majority of genuinely relevant Europe PMC results (33 of 35
-    // candidates in one real search) — its ranking works by MeSH terms and
-    // synonyms, not just literal keyword occurrence, so a real match often
-    // doesn't share the searched words verbatim in the abstract text
-    // itself (e.g. "Cyp1a2-null mice" for a search on "knockout").
-    if (p.source === "Europe PMC") return true;
-    const text = (p.abstract || "").toLowerCase();
-    return requiredTerms.some(t => text.includes(t));
-  });
+  // This used to re-check each result for a literal keyword match against
+  // the query, as a cost-control backstop before the (paid) AI relevance
+  // pass. It was removed once it became clear it applied to every current
+  // source, not just one: OpenAlex, Semantic Scholar, Europe PMC and CORE
+  // are all sent the actual query directly and rank results with their own
+  // concept/ML-based relevance search — not a literal keyword index — so a
+  // real match often doesn't share the searched words verbatim in the
+  // returned abstract (e.g. "Cyp1a2-null mice" for a search on
+  // "knockout"). Re-rejecting those here (one real search lost 33 of 35
+  // genuinely relevant Europe PMC candidates this way) was silently
+  // throwing away real results — the actual cause of "too few results"
+  // reports, not noise control. The AI highlighting step downstream still
+  // does its own, far more capable relevance judgement, and is the right
+  // place for that check now.
+  return papers;
 }
 
 function dedupe(papers) {
@@ -1149,6 +1277,53 @@ ${paras.map(x => `<p style="margin:0 0 14px;">${linkify(x)}</p>`).join("\n")}
   return { subject, html, text };
 }
 
+// ---------- Trial-ending reminder ----------
+// Not yet a legal requirement in the UK — the DMCC Act 2024's subscription
+// regime (which will mandate exactly this kind of reminder) hasn't commenced
+// and isn't expected to until January 2027 at the earliest. Built now anyway,
+// both because it's good practice regardless of enforcement, and because the
+// content below is written to already satisfy what the eventual rule will
+// require: the renewal date and amount, the total minimum payable, and clear
+// cancellation steps with a deadline — sent on a "durable medium" (email)
+// with its purpose immediately apparent from the subject line.
+// Stripe fires `customer.subscription.trial_will_end` automatically 3 days
+// before a trial converts, so no custom cron/polling is needed for the
+// timing — just a handler for the event Stripe already sends.
+function buildTrialEndingEmail({ price, trialEnd, appUrl, contactEmail }) {
+  const hasPrice = !!(price && typeof price.unit_amount === "number" && price.recurring);
+  const amount = hasPrice ? formatMoney(price.unit_amount, price.currency) : "the plan price";
+  const interval = hasPrice ? price.recurring.interval : null;
+  const n = hasPrice ? (price.recurring.interval_count || 1) : 1;
+  const every = interval ? (n === 1 ? interval : `${n} ${interval}s`) : null;
+  const endText = trialEnd ? ukDate(trialEnd) : "soon";
+  const subject = `Your LitMark free trial ends on ${endText}`;
+  const heading = "Your free trial is ending soon";
+
+  const facts = [
+    ["Your trial ends", endText],
+    ["Unless you cancel before then", `${amount} will be charged on ${endText}, and the minimum you'd pay if you don't cancel in time`],
+    ["After that", `your subscription renews automatically${every ? ` every ${every}` : ""} until you cancel`]
+  ];
+  const paras = [
+    `How to cancel: go to ${appUrl} and choose "Login/Sign up", enter this email address to get a login link, then open Account and choose "Manage subscription". Cancel before ${endText} and you won't be charged.`,
+    `Logging in again: go to ${appUrl} and choose "Login/Sign up", then enter this email address. We'll email you a login link that works for 15 minutes.`,
+    `Questions? Email ${contactEmail}.`
+  ];
+  const text = [heading, "", ...facts.map(([k, v]) => `${k}: ${v}`), "", ...paras.flatMap(x => [x, ""]), "LitMark: We find it. You write it. Nothing fake."].join("\n");
+  const linkify = s => emailEsc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#1A3FB0;">$1</a>');
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;padding:16px;">
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#14161A;line-height:1.55;font-size:15px;">
+<h1 style="font-size:22px;margin:0 0 4px;">${emailEsc(heading)}</h1>
+<p style="margin:0 0 18px;color:#6E7166;">We find it. You write it. Nothing fake.</p>
+<div style="background:#F1F0E8;border-left:4px solid #C6F135;padding:14px 16px;border-radius:8px;margin:0 0 18px;">
+${facts.map(([k, v]) => `<p style="margin:0 0 8px;"><b>${emailEsc(k)}:</b> ${emailEsc(v)}</p>`).join("\n")}
+</div>
+${paras.map(x => `<p style="margin:0 0 14px;">${linkify(x)}</p>`).join("\n")}
+</div>
+</body></html>`;
+  return { subject, html, text };
+}
+
 const webhookDeps = () => ({ stripe, sendEmail, secret: STRIPE_WEBHOOK_SECRET, appUrl: APP_URL, contactEmail: CONTACT_EMAIL, termsVersion: TERMS_VERSION, trialDays: TRIAL_DAYS });
 
 async function handleStripeWebhook(req, res, deps = webhookDeps()) {
@@ -1164,6 +1339,36 @@ async function handleStripeWebhook(req, res, deps = webhookDeps()) {
     console.warn("[webhook] rejected a request with a bad signature:", err.message);
     return res.status(400).send("Bad signature");
   }
+  if (event.type === "customer.subscription.trial_will_end") {
+    const sub = event.data.object;
+    try {
+      if (sub.metadata && sub.metadata.trial_reminder_emailed === "true") return res.json({ received: true, duplicate: true });
+      const customer = await stripeClient.customers.retrieve(sub.customer);
+      const to = customer && !customer.deleted ? customer.email : null;
+      if (!to) {
+        console.warn("[webhook] trial_will_end had no customer email, so no reminder was sent");
+        return res.json({ received: true });
+      }
+      const msg = buildTrialEndingEmail({
+        price: sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price,
+        trialEnd: sub.trial_end ? new Date(sub.trial_end * 1000) : null,
+        appUrl: deps.appUrl,
+        contactEmail: deps.contactEmail
+      });
+      await send({ to, ...msg });
+      console.log("[webhook] sent the trial-ending reminder");
+      try {
+        await stripeClient.subscriptions.update(sub.id, { metadata: { ...sub.metadata, trial_reminder_emailed: "true" } });
+      } catch (err) {
+        console.warn("[webhook] sent the reminder but couldn't mark it as sent:", err.message);
+      }
+      return res.json({ received: true, emailed: true });
+    } catch (err) {
+      console.error("[webhook] trial reminder failed (Stripe will retry):", err.message + emailFailureHint(err.message));
+      return res.status(500).send("Will retry");
+    }
+  }
+
   if (event.type !== "checkout.session.completed") return res.json({ received: true });
 
   const session = event.data.object;
@@ -1354,9 +1559,15 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
       searchEuropePMC(searchQuery, oaOpts),
       searchEuropePMC(question, oaOpts),
       searchCORE(searchQuery, oaOpts),
-      searchCORE(question, oaOpts)
+      searchCORE(question, oaOpts),
+      searchDOAJ(searchQuery, oaOpts),
+      searchDOAJ(question, oaOpts),
+      searchCrossref(searchQuery, oaOpts),
+      searchCrossref(question, oaOpts),
+      searchERIC(searchQuery, oaOpts),
+      searchERIC(question, oaOpts)
     ]);
-    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)", "CORE(query)", "CORE(raw)"];
+    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)", "CORE(query)", "CORE(raw)", "DOAJ(query)", "DOAJ(raw)", "Crossref(query)", "Crossref(raw)", "ERIC(query)", "ERIC(raw)"];
     fetches.forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
       else console.log(`${labels[i]}: ${f.value.length} results`);
@@ -1471,10 +1682,10 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     ]);
 
     const [supportFetches, counterFetches] = await Promise.all([
-      Promise.allSettled([searchOpenAlex(supportQuery, oaOpts), searchSemanticScholar(supportQuery, oaOpts), searchEuropePMC(supportQuery, oaOpts), searchCORE(supportQuery, oaOpts)]),
-      Promise.allSettled([searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts), searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts)])
+      Promise.allSettled([searchOpenAlex(supportQuery, oaOpts), searchSemanticScholar(supportQuery, oaOpts), searchEuropePMC(supportQuery, oaOpts), searchCORE(supportQuery, oaOpts), searchDOAJ(supportQuery, oaOpts), searchCrossref(supportQuery, oaOpts), searchERIC(supportQuery, oaOpts)]),
+      Promise.allSettled([searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts), searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts), searchDOAJ(counterQuery, oaOpts), searchCrossref(counterQuery, oaOpts), searchERIC(counterQuery, oaOpts)])
     ]);
-    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)"];
+    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "DOAJ(support)", "Crossref(support)", "ERIC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)", "DOAJ(counter)", "Crossref(counter)", "ERIC(counter)"];
     [...supportFetches, ...counterFetches].forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
     });
@@ -1733,7 +1944,10 @@ async function lookupPaper({ guessTitle, guessAuthor, guessYear, guessDoi }) {
     searchOpenAlex(query, { requireOA: false }),
     searchSemanticScholar(query, { requireOA: false }),
     searchEuropePMC(query, { requireOA: false }),
-    searchCORE(query, { requireOA: false })
+    searchCORE(query, { requireOA: false }),
+    searchDOAJ(query, { requireOA: false }),
+    searchCrossref(query, { requireOA: false }),
+    searchERIC(query, { requireOA: false })
   ]);
   const candidates = dedupe(results.flatMap(r => r.status === "fulfilled" ? r.value : []));
   if (candidates.length === 0) return null;
