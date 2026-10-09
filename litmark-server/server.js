@@ -1763,6 +1763,90 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
+// ---------- Add a specific paper to a folder by DOI ----------
+// A student sometimes already knows the exact paper they want — a
+// recommendation from a supervisor, something cited elsewhere — rather
+// than searching by topic. This takes a DOI they paste in, fetches the
+// REAL paper with the same exact lookup the citation auditor uses
+// (findByDoiDirect, not a fuzzy title guess), and runs it through the
+// same highlighting Claude already does for every search result, against
+// the folder's own research question — so the student sees why (or
+// whether) it's actually relevant before it lands in their folder.
+app.post("/api/add-by-doi", requireAuth, rateLimit, async (req, res) => {
+  const doi = cleanDoi(req.body.doi);
+  const question = (req.body.question || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing question" });
+  if (!doi || !/^10\.\d{4,9}\/\S+$/.test(doi)) {
+    return res.status(400).json({ error: "That doesn't look like a valid DOI. It should look like 10.1038/s41586-020-2649-2, or a doi.org link." });
+  }
+
+  try {
+    const paper = await findByDoiDirect(doi);
+    if (!paper) {
+      // Tells "not a real/registered DOI" apart from "real, but no
+      // abstract in any source we can read" — the same distinction the
+      // citation auditor relies on, just as useful here: one means check
+      // what you pasted, the other means the paper's genuine but we can't
+      // fetch its abstract right now.
+      const registered = await doiRegistration(doi);
+      if (registered === "no") {
+        return res.status(404).json({ error: "That DOI doesn't resolve to a registered paper — double-check it's correct." });
+      }
+      return res.status(404).json({ error: "Found the DOI, but couldn't get an abstract for it from any source we search — it may not be indexed yet, or may not be openly readable." });
+    }
+
+    // Same full-text upgrade /api/search gives every result: if Europe PMC
+    // has the full text, pull real Methods/Results excerpts before
+    // highlighting, so Claude already has the best material to quote from
+    // on this one pass rather than a second re-highlight afterwards.
+    let withExcerpts = paper;
+    try {
+      const pmcid = paper.pmcid || await findPmcMatchByDoi(paper.doi);
+      if (pmcid) {
+        const excerpts = await fetchPmcFullText(pmcid);
+        withExcerpts = {
+          ...paper, hasFullText: true, pmcid,
+          pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`,
+          methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt
+        };
+      }
+    } catch {}
+
+    const [highlighted] = await highlightPapers(question, [withExcerpts]);
+    // highlightPapers drops a paper entirely when Claude can't locate a
+    // genuinely relevant quote — the right call for search results, but
+    // here the student deliberately asked for this exact paper, so it's
+    // still returned; lowRelevance just tells the folder UI to flag it
+    // rather than silently treating it as a strong match.
+    let result = highlighted;
+    if (!result) {
+      // The highlighter only ever says "no quotable sentence" — it never
+      // says WHY. For a paper the student deliberately chose, a bare "not
+      // relevant" flag isn't enough to act on, so this asks the same
+      // question buildSummarisePrompt already answers for a saved paper
+      // (does this actually help with the question, and if not, why not —
+      // wrong population, wrong setting, background only, etc.) and keeps
+      // that explanation to show alongside the warning.
+      let whyNotRelevant = null;
+      try {
+        const msg = await createMessageWithRetry({
+          model: MODEL,
+          max_tokens: 200,
+          temperature: 0,
+          messages: [{ role: "user", content: buildSummarisePrompt(question, withExcerpts.title, withExcerpts.abstract) }]
+        });
+        whyNotRelevant = msg.content.find(b => b.type === "text")?.text?.trim() || null;
+      } catch {}
+      result = { ...withExcerpts, highlights: [], suitability: null, lowRelevance: true, whyNotRelevant };
+    }
+
+    res.json({ result });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Couldn't look up that paper", detail: err.message });
+  }
+});
+
 // ---------- Essay Citation Auditor ----------
 // The student pastes a finished essay. Claude extracts every in-text
 // citation and the specific claim it's attached to. For each one, we
