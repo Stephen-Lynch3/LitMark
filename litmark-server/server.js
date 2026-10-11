@@ -2467,43 +2467,57 @@ app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
-// ---------- Citation Audit: file upload (.docx / .pdf / .txt) ----------
-// Accepts a Word doc or plain text file instead of pasted text. Extraction
+// ---------- Shared file-text extraction (.docx / .pdf / .txt) ----------
+// Used by both Citation Audit's file upload and Hit the Mark. Extraction
 // is the one genuinely new failure mode here — .docx is a zipped bundle of
 // XML under the hood, handled by the well-established `mammoth` library
-// rather than anything hand-rolled.
-app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-  const name = (req.file.originalname || "").toLowerCase();
-
-  let essayText;
+// rather than anything hand-rolled. Throws an Error with a student-facing
+// message (safe to put straight in a 400 response) on any failure.
+async function extractTextFromFile(file) {
+  const name = (file.originalname || "").toLowerCase();
+  let text;
   try {
     if (name.endsWith(".docx")) {
-      const { value } = await mammoth.extractRawText({ buffer: req.file.buffer });
-      essayText = value;
+      const { value } = await mammoth.extractRawText({ buffer: file.buffer });
+      text = value;
     } else if (name.endsWith(".txt")) {
-      essayText = req.file.buffer.toString("utf-8");
+      text = file.buffer.toString("utf-8");
     } else if (name.endsWith(".pdf")) {
       // Imported lazily, and from the library's inner file: pdf-parse's
       // top-level entry runs a debug routine on import that can crash when
       // loaded this way. Loading it only when a PDF is actually uploaded
       // also means a problem here can't affect anything else in the app.
       const { default: pdfParse } = await import("pdf-parse/lib/pdf-parse.js");
-      const parsed = await pdfParse(req.file.buffer);
-      essayText = parsed.text || "";
-      if (essayText.replace(/\s+/g, "").length < 200) {
-        return res.status(400).json({ error: "That PDF doesn't seem to contain readable text — it may be a scan or an image. Export a text-based PDF from Word or Google Docs, or paste the text in instead." });
+      const parsed = await pdfParse(file.buffer);
+      text = parsed.text || "";
+      if (text.replace(/\s+/g, "").length < 200) {
+        throw new Error("That PDF doesn't seem to contain readable text — it may be a scan or an image. Export a text-based PDF from Word or Google Docs, or paste the text in instead.");
       }
     } else {
-      return res.status(400).json({ error: "Unsupported file type — please upload a .docx, .pdf or .txt file" });
+      throw new Error("Unsupported file type — please upload a .docx, .pdf or .txt file");
     }
   } catch (err) {
+    if (err.message?.startsWith("That PDF") || err.message?.startsWith("Unsupported file type")) throw err;
     console.error("File extraction failed:", err.message);
-    return res.status(400).json({ error: "Couldn't read that file — it may be corrupted, password-protected, or an older .doc format (only .docx, .pdf and .txt are supported)" });
+    throw new Error("Couldn't read that file — it may be corrupted, password-protected, or an older .doc format (only .docx, .pdf and .txt are supported)");
+  }
+  text = (text || "").trim();
+  if (!text) throw new Error("That file appears to be empty");
+  return text;
+}
+
+// ---------- Citation Audit: file upload (.docx / .pdf / .txt) ----------
+// Accepts a Word doc or plain text file instead of pasted text.
+app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+
+  let essayText;
+  try {
+    essayText = await extractTextFromFile(req.file);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 
-  essayText = (essayText || "").trim();
-  if (!essayText) return res.status(400).json({ error: "That file appears to be empty" });
   if (essayText.length > 100000) return res.status(400).json({ error: "That essay is too long — 100,000 characters max (around 15,000 words)" });
 
   // Multipart form fields (alongside the uploaded file) arrive as plain
@@ -2521,6 +2535,160 @@ app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Couldn't complete the citation audit right now — try again in a moment.", detail: err.message });
+  }
+});
+
+// =====================================================================
+// HIT THE MARK — upload marking criteria + an essay, get a per-criterion
+// hit/partly-there/missing read, with real papers surfaced for genuine
+// evidence gaps. Never grades or predicts a numeric mark (too subjective,
+// and wrong would damage trust), and never writes or rewrites a word of
+// the student's essay — only tells them where their own evidence is thin
+// and hands them real sources to look at themselves.
+// =====================================================================
+
+// Same convention as Citation Audit: ~15,000 words, enforced both client
+// and server side.
+const HITMARK_CHAR_LIMIT = 100000;
+
+// Reuses the exact same multi-source search + keyword-filter + highlight
+// pipeline as the main Search feature (see /api/search above), factored
+// out so each criterion gap can run its own targeted search. Skips the
+// optional full-text PMC re-highlight enrichment step that /api/search
+// does — a nice-to-have there, but Hit the Mark may run several of these
+// per submission, so keeping each one leaner keeps total latency sane.
+async function runLiteratureSearch(question, { requireOA = true, limit = 20 } = {}) {
+  const searchQuery = await buildSearchQuery(question);
+  const oaOpts = { requireOA };
+  const fetches = await Promise.allSettled([
+    searchOpenAlex(searchQuery, oaOpts),
+    searchSemanticScholar(searchQuery, oaOpts),
+    searchOpenAlex(question, oaOpts),
+    searchSemanticScholar(question, oaOpts),
+    searchEuropePMC(searchQuery, oaOpts),
+    searchEuropePMC(question, oaOpts),
+    searchCORE(searchQuery, oaOpts),
+    searchCORE(question, oaOpts),
+    searchDOAJ(searchQuery, oaOpts),
+    searchDOAJ(question, oaOpts),
+    searchCrossref(searchQuery, oaOpts),
+    searchCrossref(question, oaOpts),
+    searchERIC(searchQuery, oaOpts),
+    searchERIC(question, oaOpts)
+  ]);
+  const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
+  const papers = interleaveBySource(requireTermMatch(allFound, [searchQuery, question])).slice(0, 36);
+  if (papers.length === 0) return { results: [], searchQuery };
+  const highlighted = await highlightPapers(question, papers);
+  const sorted = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1));
+  return { results: sorted.slice(0, limit), searchQuery };
+}
+
+// One Claude call does two jobs at once: breaks the (often loosely-worded)
+// rubric into distinct gradable items, and assesses the essay against each
+// one. For a gap, it also says WHY kind of gap it is — "evidence" (needs
+// more/better literature, so we go find some) vs "formatting" (a
+// referencing/bibliography mechanics issue that more sources won't fix,
+// so we point to Citation Check instead) vs "other" (a structural issue,
+// e.g. no clear thesis, that no source would fix either) — and, only for
+// evidence gaps, a short search query aimed at exactly that gap.
+async function classifyAgainstCriteria(criteriaText, essayText) {
+  const prompt = `A student has given you their marking criteria/rubric and their own essay. Break the criteria into the distinct, individually gradable items it contains (usually 4-8 — merge trivial sub-points, split criteria that bundle two unrelated requirements), and assess the essay against EACH one.
+
+Marking criteria/rubric:
+"""
+${criteriaText}
+"""
+
+Student's essay:
+"""
+${essayText}
+"""
+
+For each criterion return:
+- "criterion": a short, plain paraphrase of the criterion (a few words to one line) — not copied verbatim if the rubric wording is long-winded
+- "status": "hit" if the essay clearly satisfies it, "partly" if there's some relevant content but it's thin, narrow, one-sided, or incomplete, "missing" if the essay doesn't address it at all
+- "reason": one or two plain, specific sentences explaining why, grounded in what the essay actually does or doesn't do — for "hit", you may briefly quote or closely paraphrase the relevant part
+- "gapType": ONLY for "partly" or "missing" — "evidence" if what's missing is literature/sources (the fix is finding and citing more or better research), "formatting" if the issue is citation/referencing mechanics (e.g. citations not matching the bibliography, inconsistent or missing referencing style) rather than a lack of sources, or "other" if it's a structural/argument issue that no amount of extra sources would fix (e.g. no clear thesis). Use null for "hit".
+- "searchQuery": ONLY when gapType is "evidence" — a short, keyword-style academic database search query (4-8 words, not a sentence) that would find real literature specifically filling THIS gap, informed by the essay's actual topic. Use null otherwise.
+
+Never suggest how to rewrite or word the essay itself — only assess and explain.
+
+Respond with ONLY a JSON array, nothing else, in this exact shape:
+[{"criterion": "...", "status": "hit", "reason": "...", "gapType": null, "searchQuery": null}]`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 4000,
+    temperature: 0, // judgment task — the same essay against the same
+                    // criteria should get the same read every time
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "[]";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch (err) {
+    // Deliberately not logging the model's output: it may contain sentences
+    // lifted from the student's essay or marking criteria.
+    console.error(`classifyAgainstCriteria: JSON parse failed (stop_reason: ${msg.stop_reason}, ${clean.length} chars, not logged)`);
+    throw new Error("Couldn't analyse the essay against your criteria right now — try again in a moment.");
+  }
+  if (!Array.isArray(parsed)) throw new Error("Couldn't analyse the essay against your criteria right now — try again in a moment.");
+
+  const STATUSES = ["hit", "partly", "missing"];
+  const GAP_TYPES = ["evidence", "formatting", "other"];
+  return parsed.map(c => ({
+    criterion: (c?.criterion || "").toString().trim().slice(0, 300) || "Untitled criterion",
+    status: STATUSES.includes(c?.status) ? c.status : "partly",
+    reason: (c?.reason || "").toString().trim().slice(0, 1000),
+    gapType: GAP_TYPES.includes(c?.gapType) ? c.gapType : null,
+    searchQuery: typeof c?.searchQuery === "string" && c.searchQuery.trim() ? c.searchQuery.trim().slice(0, 200) : null
+  })).slice(0, 20);
+}
+
+app.post("/api/hit-the-mark", requireAuth, rateLimit, upload.fields([{ name: "criteriaFile", maxCount: 1 }, { name: "essayFile", maxCount: 1 }]), async (req, res) => {
+  let criteriaText, essayText;
+  try {
+    const criteriaFile = req.files?.criteriaFile?.[0];
+    criteriaText = criteriaFile ? await extractTextFromFile(criteriaFile) : (req.body.criteriaText || "").toString().trim();
+    const essayFile = req.files?.essayFile?.[0];
+    essayText = essayFile ? await extractTextFromFile(essayFile) : (req.body.essayText || "").toString().trim();
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  if (!criteriaText) return res.status(400).json({ error: "Missing marking criteria — upload a file or paste it in" });
+  if (!essayText) return res.status(400).json({ error: "Missing essay — upload a file or paste it in" });
+  if (criteriaText.length > HITMARK_CHAR_LIMIT) return res.status(400).json({ error: `That marking criteria is too long — ${HITMARK_CHAR_LIMIT.toLocaleString()} characters max (around 15,000 words)` });
+  if (essayText.length > HITMARK_CHAR_LIMIT) return res.status(400).json({ error: `That essay is too long — ${HITMARK_CHAR_LIMIT.toLocaleString()} characters max (around 15,000 words)` });
+
+  try {
+    const criteria = await classifyAgainstCriteria(criteriaText, essayText);
+    if (criteria.length === 0) {
+      return res.json({ criteria: [], counts: { hit: 0, partly: 0, missing: 0 }, warning: "Couldn't identify distinct criteria in that text — check it's a marking rubric or criteria list, not something else." });
+    }
+
+    // Evidence gaps each need their own literature search — limited
+    // concurrency so a submission with several gaps doesn't fire off a huge
+    // number of simultaneous external requests all at once.
+    const withPapers = await mapWithConcurrency(criteria, 2, async (c) => {
+      if (c.gapType !== "evidence" || !c.searchQuery) return c;
+      try {
+        const { results } = await runLiteratureSearch(c.searchQuery, { requireOA: true, limit: 5 });
+        return { ...c, papers: results };
+      } catch (err) {
+        console.error("[hit-the-mark] gap search failed:", err.message);
+        return { ...c, papers: [] };
+      }
+    });
+
+    const counts = withPapers.reduce((acc, c) => { acc[c.status] = (acc[c.status] || 0) + 1; return acc; }, { hit: 0, partly: 0, missing: 0 });
+    res.json({ criteria: withPapers, counts, extractedCriteriaLength: criteriaText.length, extractedEssayLength: essayText.length });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: err.message || "Couldn't complete the Hit the Mark check right now — try again in a moment." });
   }
 });
 
@@ -2732,6 +2900,238 @@ app.post("/api/summarize-folder", requireAuth, rateLimit, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Summarize failed", detail: err.message });
+  }
+});
+
+// =====================================================================
+// VERA — the always-available companion panel (the assistant persona
+// behind "Ask LitMark"). Two jobs, and nothing else: explain how
+// LitMark's own features work, or answer a
+// question grounded strictly in papers the student has already saved to
+// their own folders. It never produces text a student could hand in as
+// their own work, however the request is phrased — that's the one rule
+// the whole site is built around, so it's enforced here as firmly as
+// everywhere else, not just pattern-matched against the word "write".
+// =====================================================================
+
+const SUPPORT_EMAIL = "litmarkcontactus@gmail.com";
+const MAX_ASK_FOLDERS = 25;
+const MAX_ASK_PAPERS_PER_FOLDER = 25;
+const MAX_ASK_PAPERS_TOTAL = 150;
+
+// Folders live only in the student's own browser (localStorage), never on
+// this server, so the client sends along whatever's relevant on every
+// question. Reuses sanitizeFolderPapers' per-paper cleaning so a folder's
+// papers get exactly the same trust/length treatment Citation Audit's
+// "check against a folder" already gives them. Bounded both per-folder and
+// in total, since a long-time student's whole library could otherwise make
+// for a very large prompt.
+function sanitizeFoldersForAsk(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  let total = 0;
+  for (const f of raw.slice(0, MAX_ASK_FOLDERS)) {
+    if (total >= MAX_ASK_PAPERS_TOTAL) break;
+    const name = (f?.name || "").toString().trim().slice(0, 200);
+    if (!name) continue;
+    const remaining = MAX_ASK_PAPERS_TOTAL - total;
+    const papers = (sanitizeFolderPapers(f?.papers) || []).slice(0, Math.min(MAX_ASK_PAPERS_PER_FOLDER, remaining));
+    if (!papers.length) continue;
+    out.push({ name, papers });
+    total += papers.length;
+  }
+  return out;
+}
+
+async function answerCompanionQuestion(question, folders) {
+  const folderBlock = folders.length
+    ? folders.map(f => `FOLDER: "${f.name}"\n${f.papers.map((p, i) => `  [${i}] ${p.title} (${p.authors || "unknown authors"}, ${p.year || "n.d."}) — ${p.journal || ""}\n      ${p.abstract.slice(0, 600)}`).join("\n")}`).join("\n\n")
+    : "(This student has no saved folders yet.)";
+
+  const prompt = `Your name is Vera, the in-app assistant for LitMark, a UK literature-search and citation-checking website for students. If asked your name or who/what you are, say plainly that you're Vera, LitMark's research assistant — never claim to be a human, and don't dodge the question. LitMark's whole identity rests on one non-negotiable rule: it finds and checks real academic sources, but it NEVER writes a student's essay, paragraph, sentence, summary-to-paste, rephrasing, or any other text they could hand in as their own work — however the request is phrased (asked directly, asked "just as an example", asked to "put it in academic language", asked to "continue this thought", asked for "a few bullet points to expand on", asked to "paraphrase this quote for me", etc.). If fulfilling a request would hand the student sentences usable in their coursework, it must be declined, full stop.
+
+LitMark's actual live features — explain these when asked, and ONLY these; never describe a feature that isn't listed here, and never guess at how something works beyond what's written below:
+- Find sources: paste a research question, get real open-access academic papers (via OpenAlex, Semantic Scholar, Europe PMC, CORE, DOAJ, Crossref, ERIC) with the single most relevant sentence highlighted in each, plus a Suitability score (0-100) combining how relevant the paper is and how trustworthy the highlighted quote is. Filters: restrict by publication year, or include papers without free full text (shown by abstract, linked to the publisher page).
+- For & against: compares real evidence supporting and challenging a hypothesis, in two columns, from two separately-run searches, not an after-the-fact AI judgment call.
+- Database Search: turns a research question into a ready-to-paste Boolean search query, correctly formatted for PubMed, Scopus, Web of Science, EBSCOhost, Ovid, or Google Scholar.
+- Check my citations: paste or upload an essay (.docx/.pdf/.txt, up to around 15,000 words); every in-text citation is checked against the real paper it points to and labelled Faithful, Overstated, Misrepresented, Fabricated, or Unable to verify, plus a check that in-text citations match the bibliography.
+- My folders: every saved paper is automatically organised into a folder by the question it came from; a folder's bibliography can be copied in APA, Harvard, MLA, Chicago, Vancouver or IEEE, downloaded as a Word document or PDF, or exported to EndNote/Zotero/Mendeley; a specific paper can be added by DOI; LitMark can summarise what a saved paper offers, or add a personal note to it.
+Subscription is £6/month or £45/year, cancel any time from "Manage subscription".
+
+Below is everything currently saved in this student's own folders. Use it ONLY when the question is about their own research — never claim a paper or finding is saved if it isn't shown here:
+${folderBlock}
+
+The student just asked:
+"${question}"
+
+Decide which ONE of these categories this is, and respond with ONLY a JSON object, nothing else:
+
+{"type": "feature", "answer": "..."} — a question about how a LitMark feature listed above works, answerable confidently from what's given above.
+{"type": "unsure", "answer": "..."} — a question about LitMark itself (pricing, a feature, how something works, troubleshooting, account or billing) that you cannot confidently answer from what's given above. The answer MUST say plainly that you're not sure, and point them to email ${SUPPORT_EMAIL}.
+{"type": "folder", "answer": "...", "referencedFolders": ["exact folder name", ...]} — a question about the student's own research or saved papers. Answer ONLY using the folder contents given above, never inventing a paper or finding that isn't shown. If nothing in their folders is relevant, say so plainly rather than guessing, and leave referencedFolders empty. Every name in referencedFolders must exactly match a folder name given above.
+{"type": "decline", "answer": "..."} — ANY request, however phrased, asking you to generate, draft, write, rephrase, summarise-for-pasting, continue, or otherwise produce text the student could use in their own coursework. The answer should briefly and kindly explain that LitMark finds and checks sources but never writes for you, and offer to help find or explain the sources instead.
+{"type": "off_topic", "answer": "..."} — anything unrelated to LitMark or the student's own research or saved papers (general knowledge, small talk, etc). Say plainly this is outside what you can help with here, scoped to LitMark and their saved research.
+
+Keep "answer" conversational, specific, and under about 80 words.`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 700,
+    temperature: 0, // guardrail-heavy — the decline/scope behaviour needs to
+                     // be reliable, not creatively variable
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch (err) {
+    console.error(`answerCompanionQuestion: JSON parse failed (stop_reason: ${msg.stop_reason})`);
+    throw new Error("Couldn't answer that right now — try again in a moment.");
+  }
+
+  const TYPES = ["feature", "unsure", "folder", "decline", "off_topic"];
+  const type = TYPES.includes(parsed?.type) ? parsed.type : "off_topic";
+  const answer = (parsed?.answer || "").toString().trim().slice(0, 2000)
+    || `Sorry, I couldn't come up with an answer for that — try again, or email ${SUPPORT_EMAIL}.`;
+  const knownNames = new Set(folders.map(f => f.name));
+  const referencedFolders = type === "folder" && Array.isArray(parsed.referencedFolders)
+    ? [...new Set(parsed.referencedFolders.filter(n => knownNames.has(n)))].slice(0, 5)
+    : [];
+
+  return { type, answer, referencedFolders };
+}
+
+app.post("/api/ask", requireAuth, rateLimit, async (req, res) => {
+  const question = (req.body.question || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing question" });
+  if (question.length > 2000) return res.status(400).json({ error: "That question's a bit long — keep it under 2,000 characters." });
+
+  const folders = sanitizeFoldersForAsk(req.body.folders);
+
+  try {
+    const result = await answerCompanionQuestion(question, folders);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: err.message || "Couldn't answer that right now — try again in a moment." });
+  }
+});
+
+// ---------------------------------------------------------------------
+// VERA — public companion, for litmark.org itself (the homepage).
+// A visitor here has no account and no saved folders, so this version
+// only ever draws on the actual marketing/About content below — verbatim
+// from about.html and the homepage's own hero copy, not a hand-written
+// description that could drift out of sync with what the site actually
+// says. It never sees folder data; a question about "my" research is
+// always steered toward signing up, same as the real thing would need.
+// ---------------------------------------------------------------------
+
+// Sourced directly from about.html and the homepage hero — keep this in
+// sync by eye if either page's copy changes, rather than re-describing
+// the product from scratch here.
+const LITMARK_ABOUT_CONTENT = `
+Mission / hero copy (homepage): "We find it. You write it. Nothing fake." — "Real papers. Honest citations. Nothing invented." LitMark gives students access to 300 million+ papers. £6/month or £45/year after a 7-day free trial (card required, cancel any time before the trial ends).
+
+About page:
+LitMark is a research and citation tool built for students — not another AI tool that writes your essay for you, but one that helps you find, evaluate, and honestly cite the real evidence behind it.
+
+What it actually does:
+- Find sources — search real academic papers for your assessment question — free to read by default, with an option to include papers without free full text (shown by abstract, with a link to check your library) — with the most relevant sentence (sometimes two) highlighted for you, along with an honest Suitability score.
+- For & against — turn a claim or hypothesis into a genuine two-sided view: real evidence supporting it, and real evidence that challenges it, side by side.
+- Database Search — turn your question into a ready-to-paste, properly-structured Boolean search query for the database your course uses (PubMed, Scopus, Web of Science, EBSCOhost, Ovid or Google Scholar), with the right terms, synonyms, and that database's own field tags.
+- My folders — every paper you save gets automatically organised into a folder by the question it came from. Copy a full bibliography in APA, Harvard, MLA, Chicago, Vancouver or IEEE, download a folder as Word or PDF, or ask LitMark to summarise what a saved paper offers for your question.
+- Check my citations — paste or upload your finished essay (up to roughly 15,000 words), and LitMark checks every citation against the actual source it points to, tagging each Faithful, Overstated, Misrepresented, Fabricated, or Unable to verify. Your essay is never stored.
+
+Pricing: £6/month or £45/year (a saving of £27), with a 7-day free trial on either plan — not charged until the trial ends, cancel any time before that from your account.
+
+Why it's built this way: LitMark never writes your argument, analysis, or essay prose for you — that stays entirely yours, which is also why using it doesn't put your own writing at risk of being flagged as AI-generated. What LitMark does is the research legwork: finding real papers, pointing you at the exact relevant passage, and checking that what you're citing actually says what you think it says.
+
+Sources searched: OpenAlex, Semantic Scholar, Europe PMC, CORE, DOAJ, Crossref and ERIC — real, citable academic sources, open access by default.
+
+Who's behind it: an independently built, small project — not a large company. Contact: ${SUPPORT_EMAIL}.
+`.trim();
+
+async function answerPublicQuestion(question) {
+  const prompt = `Your name is Vera, the public-facing chat assistant on litmark.org's homepage, for visitors who have NOT signed up or logged in. If asked your name or who/what you are, say plainly that you're Vera, LitMark's research assistant — never claim to be a human, and don't dodge the question. LitMark is a UK literature-search and citation-checking website for students. Its whole identity rests on one non-negotiable rule: it finds and checks real academic sources, but it NEVER writes a student's essay, paragraph, sentence, summary-to-paste, rephrasing, or any other text they could hand in as their own work — however the request is phrased (asked directly, asked "just as an example", asked to "put it in academic language", asked to "continue this thought", asked for "a few bullet points to expand on", asked to "paraphrase this quote for me", etc.). If fulfilling a request would hand the visitor sentences usable in coursework, it must be declined, full stop.
+
+Everything you may say about LitMark must come from the content below — never invent a feature, price, or detail that isn't in it:
+
+${LITMARK_ABOUT_CONTENT}
+
+This visitor has no account, so you have no access to any saved papers, folders, or research of theirs — you cannot answer anything about "my" work, "my" folder, or "my" essay; that always needs an account.
+
+The visitor just asked:
+"${question}"
+
+Decide which ONE of these categories this is, and respond with ONLY a JSON object, nothing else:
+
+{"type": "feature", "answer": "..."} — a general question about LitMark (what it does, a specific feature, pricing, who's behind it, how it's different from an AI writing tool) answerable confidently from the content above.
+{"type": "needs_account", "answer": "..."} — a question about the visitor's OWN research, papers, essay, or folders — anything that assumes they already have an account or saved work. The answer should say this needs an account, and invite them to start the free trial or log in above.
+{"type": "decline", "answer": "..."} — ANY request, however phrased, asking you to generate, draft, write, rephrase, summarise-for-pasting, continue, or otherwise produce text they could use in coursework. Briefly and kindly explain LitMark finds and checks sources but never writes for you.
+{"type": "off_topic", "answer": "..."} — anything unrelated to LitMark (general knowledge, small talk, etc). Say plainly this is outside what you can help with here.
+
+Keep "answer" conversational, specific, and under about 70 words.`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 500,
+    temperature: 0,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch (err) {
+    console.error(`answerPublicQuestion: JSON parse failed (stop_reason: ${msg.stop_reason})`);
+    throw new Error("Couldn't answer that right now — try again in a moment.");
+  }
+
+  const TYPES = ["feature", "needs_account", "decline", "off_topic"];
+  const type = TYPES.includes(parsed?.type) ? parsed.type : "off_topic";
+  const answer = (parsed?.answer || "").toString().trim().slice(0, 1500)
+    || "Sorry, I couldn't come up with an answer for that — try again in a moment.";
+
+  return { type, answer };
+}
+
+// Per-IP rate limiting — a visitor here has no account to key off, so this
+// limits by req.ip instead. Tighter than the logged-in limit on purpose:
+// there's no subscription backing this traffic, and nothing stops one IP
+// from hammering it. Same in-memory, resets-on-redeploy trade-off as the
+// account-based limiter above (also a single process, WEB_CONCURRENCY=1).
+const publicAskUsageLog = new Map(); // ip -> array of request timestamps (ms)
+const PUBLIC_ASK_RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
+const PUBLIC_ASK_RATE_LIMIT_MAX = parseInt(process.env.PUBLIC_ASK_RATE_LIMIT_MAX || "12", 10);
+
+function publicAskRateLimit(req, res, next) {
+  if (process.env.DISABLE_AUTH === "true") return next();
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const timestamps = (publicAskUsageLog.get(ip) || []).filter(t => now - t < PUBLIC_ASK_RATE_LIMIT_WINDOW_MS);
+  if (timestamps.length >= PUBLIC_ASK_RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: "Too many questions from here in the last hour — try again shortly, or start a free trial to keep going." });
+  }
+  timestamps.push(now);
+  publicAskUsageLog.set(ip, timestamps);
+  next();
+}
+
+app.post("/api/ask-public", publicAskRateLimit, async (req, res) => {
+  const question = (req.body.question || "").toString().trim();
+  if (!question) return res.status(400).json({ error: "Missing question" });
+  if (question.length > 1000) return res.status(400).json({ error: "That question's a bit long — keep it under 1,000 characters." });
+
+  try {
+    const result = await answerPublicQuestion(question);
+    res.json(result);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: err.message || "Couldn't answer that right now — try again in a moment." });
   }
 });
 
