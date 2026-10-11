@@ -1712,9 +1712,12 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     // challenging evidence entirely.
     const dedupedSupport = dedupe(supportPapers);
     const dedupedChallenge = dedupe(counterPapers);
+    // Sized with margin above the 10 actually shown per side (below) —
+    // highlightPapers drops some candidates as not genuinely relevant, so
+    // sending exactly 10 in would often yield fewer than 10 out.
     const papers = [
-      ...interleaveBySource(dedupedSupport).slice(0, 15),
-      ...interleaveBySource(dedupedChallenge).slice(0, 15)
+      ...interleaveBySource(dedupedSupport).slice(0, 20),
+      ...interleaveBySource(dedupedChallenge).slice(0, 20)
     ];
 
     console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterPapers.length} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
@@ -1728,11 +1731,11 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
     console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
     const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
-    const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 7);
-    const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 7);
+    const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 10);
+    const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 10);
 
     // Same principle as /api/search: full-text availability is only
-    // checked on the papers actually being shown (up to 14 here, not the
+    // checked on the papers actually being shown (up to 20 here, not the
     // full candidate pool).
     const checkFullText = async (list) => mapWithConcurrency(list, 4, async (p) => {
       try {
