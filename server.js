@@ -1692,27 +1692,29 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
 
     const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
 
-    // support-first, so a paper found by both searches defaults to the
-    // "support" column rather than appearing twice or being dropped
     const supportPapers = requireTermMatch(
       dateFilter(supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [supportQuery]
     ).map(p => ({ ...p, angle: "support" }));
     const counterPapers = requireTermMatch(
       dateFilter(counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [counterQuery]
     ).map(p => ({ ...p, angle: "challenge" }));
-    const deduped = dedupe([...supportPapers, ...counterPapers]);
-    // Cap support and challenge SEPARATELY (15 each) before combining, not
-    // together as one pool sliced to 30. The support query reliably returns
-    // far more raw candidates than the counter query (literature skews that
-    // way, and the support-first dedupe above also eats counter duplicates),
-    // so a single interleaveBySource+slice(0,30) over the combined pool
-    // doesn't look at angle at all — it was handing highlightPapers a batch
-    // that could easily end up with zero surviving "challenge" papers even
-    // though the counter search found plenty, which is exactly what produced
-    // "7 for / 0 against" on effectively every search.
+    // Dedupe WITHIN each angle separately (the same paper turning up from
+    // multiple sources for one query), not ACROSS the two angles. This used
+    // to run on both lists merged together with support listed first, so
+    // any paper found by BOTH searches — common whenever the two queries
+    // share vocabulary, which happens a lot on broad or vague questions —
+    // was unconditionally kept as "support" and erased from "challenge".
+    // That silently starved the challenge side before it even reached the
+    // per-angle cap below, which is why a fix there alone (capping support
+    // and challenge separately) wasn't enough on its own. A paper genuinely
+    // relevant to both searches can now appear in both columns rather than
+    // being forced into one; that's a fair trade against hiding real
+    // challenging evidence entirely.
+    const dedupedSupport = dedupe(supportPapers);
+    const dedupedChallenge = dedupe(counterPapers);
     const papers = [
-      ...interleaveBySource(deduped.filter(p => p.angle === "support")).slice(0, 15),
-      ...interleaveBySource(deduped.filter(p => p.angle === "challenge")).slice(0, 15)
+      ...interleaveBySource(dedupedSupport).slice(0, 15),
+      ...interleaveBySource(dedupedChallenge).slice(0, 15)
     ];
 
     console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length}) / counter "${counterQuery}" (${counterPapers.length}) -> ${papers.length} after dedupe`);
