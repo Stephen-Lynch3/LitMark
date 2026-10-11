@@ -1692,24 +1692,41 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
 
     const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
 
-    // support-first, so a paper found by both searches defaults to the
-    // "support" column rather than appearing twice or being dropped
     const supportPapers = requireTermMatch(
       dateFilter(supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [supportQuery]
     ).map(p => ({ ...p, angle: "support" }));
     const counterPapers = requireTermMatch(
       dateFilter(counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [counterQuery]
     ).map(p => ({ ...p, angle: "challenge" }));
-    const papers = interleaveBySource(dedupe([...supportPapers, ...counterPapers])).slice(0, 30);
+    // Dedupe WITHIN each angle separately (the same paper turning up from
+    // multiple sources for one query), not ACROSS the two angles. This used
+    // to run on both lists merged together with support listed first, so
+    // any paper found by BOTH searches — common whenever the two queries
+    // share vocabulary, which happens a lot on broad or vague questions —
+    // was unconditionally kept as "support" and erased from "challenge".
+    // That silently starved the challenge side before it even reached the
+    // per-angle cap below, which is why a fix there alone (capping support
+    // and challenge separately) wasn't enough on its own. A paper genuinely
+    // relevant to both searches can now appear in both columns rather than
+    // being forced into one; that's a fair trade against hiding real
+    // challenging evidence entirely.
+    const dedupedSupport = dedupe(supportPapers);
+    const dedupedChallenge = dedupe(counterPapers);
+    const papers = [
+      ...interleaveBySource(dedupedSupport).slice(0, 15),
+      ...interleaveBySource(dedupedChallenge).slice(0, 15)
+    ];
 
-    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length}) / counter "${counterQuery}" (${counterPapers.length}) -> ${papers.length} after dedupe`);
+    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterPapers.length} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
 
     if (papers.length === 0) {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
     }
 
     const highlighted = await highlightPapers(question, papers);
-    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
+    const highlightedSupport = highlighted.filter(p => p.angle === "support").length;
+    const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
+    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
     const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
     const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 7);
     const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 7);
