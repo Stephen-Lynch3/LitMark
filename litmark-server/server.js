@@ -201,10 +201,32 @@ Write a concise academic database search query (4-8 keywords/phrases, literal ke
 // exact same search can succeed or fail on a source essentially at
 // random between runs (inconsistent results for identical searches).
 // One short retry recovers the large majority of transient rate limits.
-async function fetchWithRetry(url, options = {}, retries = 2, delayMs = 700) {
+//
+// A hard per-attempt timeout is just as important as the 429 retry: with
+// no timeout at all, a single source that hangs (not errors — just never
+// responds) stalls the WHOLE search, because /api/search awaits every
+// source together with Promise.allSettled, which only resolves once every
+// one of them has either answered or failed. A timeout makes "too slow"
+// behave exactly like "failed" — this source contributes 0 papers for
+// this request, same as any other error — so every OTHER source's papers
+// are completely unaffected; nothing is lost except the slow source's own
+// (already-missing, since it never answered) contribution.
+const SOURCE_TIMEOUT_MS = 9000;
+
+async function fetchWithRetry(url, options = {}, retries = 2, delayMs = 700, timeoutMs = SOURCE_TIMEOUT_MS) {
   let res;
   for (let attempt = 0; attempt <= retries; attempt++) {
-    res = await fetch(url, options);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      res = await fetch(url, { ...options, signal: controller.signal });
+    } catch (err) {
+      if (attempt === retries) throw err; // final attempt still timed out/failed — let it propagate, same as any other source error
+      await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
     if (res.status !== 429 || attempt === retries) return res;
     await new Promise(r => setTimeout(r, delayMs * (attempt + 1)));
   }
@@ -1544,6 +1566,22 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   const oaOpts = { requireOA: req.query.includePaywalled !== "1" };
 
   try {
+    // The 7 sources searched on the RAW question don't depend on the
+    // distilled query at all, so they're fired off immediately here rather
+    // than after awaiting buildSearchQuery below — that removes one whole
+    // sequential Claude round-trip (the distillation call) from the front
+    // of the critical path. Calling an async function starts it running
+    // right away; it's only the `await` that would have blocked.
+    const rawFetchPromises = [
+      searchOpenAlex(question, oaOpts),
+      searchSemanticScholar(question, oaOpts),
+      searchEuropePMC(question, oaOpts),
+      searchCORE(question, oaOpts),
+      searchDOAJ(question, oaOpts),
+      searchCrossref(question, oaOpts),
+      searchERIC(question, oaOpts)
+    ];
+
     const searchQuery = await buildSearchQuery(question);
 
     // Two nets, not one: the distilled keyword query catches precise
@@ -1551,23 +1589,18 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
     // would find — especially for open, exploratory questions ("uses of
     // X") rather than a specific claim. Searching the raw question too
     // and merging both pools substantially widens coverage.
-    const fetches = await Promise.allSettled([
+    const queryFetchPromises = [
       searchOpenAlex(searchQuery, oaOpts),
       searchSemanticScholar(searchQuery, oaOpts),
-      searchOpenAlex(question, oaOpts),
-      searchSemanticScholar(question, oaOpts),
       searchEuropePMC(searchQuery, oaOpts),
-      searchEuropePMC(question, oaOpts),
       searchCORE(searchQuery, oaOpts),
-      searchCORE(question, oaOpts),
       searchDOAJ(searchQuery, oaOpts),
-      searchDOAJ(question, oaOpts),
       searchCrossref(searchQuery, oaOpts),
-      searchCrossref(question, oaOpts),
-      searchERIC(searchQuery, oaOpts),
-      searchERIC(question, oaOpts)
-    ]);
-    const labels = ["OpenAlex(query)", "SemanticScholar(query)", "OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(query)", "EuropePMC(raw)", "CORE(query)", "CORE(raw)", "DOAJ(query)", "DOAJ(raw)", "Crossref(query)", "Crossref(raw)", "ERIC(query)", "ERIC(raw)"];
+      searchERIC(searchQuery, oaOpts)
+    ];
+
+    const fetches = await Promise.allSettled([...rawFetchPromises, ...queryFetchPromises]);
+    const labels = ["OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(raw)", "CORE(raw)", "DOAJ(raw)", "Crossref(raw)", "ERIC(raw)", "OpenAlex(query)", "SemanticScholar(query)", "EuropePMC(query)", "CORE(query)", "DOAJ(query)", "Crossref(query)", "ERIC(query)"];
     fetches.forEach((f, i) => {
       if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
       else console.log(`${labels[i]}: ${f.value.length} results`);
