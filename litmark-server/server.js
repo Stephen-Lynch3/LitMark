@@ -311,6 +311,7 @@ function normalizePaperType(rawList, title = "") {
 
 // ---------- Source 1: OpenAlex ----------
 async function searchOpenAlex(query, { requireOA = true } = {}) {
+  try {
   const url = new URL("https://api.openalex.org/works");
   url.searchParams.set("search", query);
   const filters = ["has_abstract:true"];
@@ -354,6 +355,10 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
       abstract: reconstructAbstract(w.abstract_inverted_index)
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`OpenAlex failed:`, err?.message || err);
+    return [];
+  }
 }
 
 function reconstructAbstract(inverted) {
@@ -368,6 +373,7 @@ function reconstructAbstract(inverted) {
 
 // ---------- Source 2: Semantic Scholar ----------
 async function searchSemanticScholar(query, { requireOA = true } = {}) {
+  try {
   const url = new URL("https://api.semanticscholar.org/graph/v1/paper/search");
   url.searchParams.set("query", query);
   url.searchParams.set("limit", "30");
@@ -399,6 +405,10 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       paperType: normalizePaperType(p.publicationTypes || [], p.title),
       abstract: p.abstract
     }));
+  } catch (err) {
+    console.error(`Semantic Scholar failed:`, err?.message || err);
+    return [];
+  }
 }
 
 // ---------- Source 3: Europe PMC ----------
@@ -406,6 +416,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
 // plus preprints (bioRxiv, medRxiv) — broader net, and a single clean JSON
 // call instead of NCBI's two-step XML dance. No API key needed at all.
 async function searchEuropePMC(query, { requireOA = true } = {}) {
+  try {
   const url = new URL("https://www.ebi.ac.uk/europepmc/webservices/rest/search");
   url.searchParams.set("query", requireOA ? `(${query}) AND (OPEN_ACCESS:Y)` : query);
   url.searchParams.set("format", "json");
@@ -460,6 +471,10 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
       abstract: r.abstractText ? stripXmlTags(r.abstractText) : null
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`Europe PMC failed:`, err?.message || err);
+    return [];
+  }
 }
 
 // ---------- Source 4: CORE ----------
@@ -474,6 +489,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
 // already does when any one source fails for any other reason.
 async function searchCORE(query, { requireOA = true } = {}) {
   if (!process.env.CORE_API_KEY) return [];
+  try {
   const url = new URL("https://api.core.ac.uk/v3/search/works");
   url.searchParams.set("q", query);
   url.searchParams.set("limit", "30");
@@ -512,6 +528,10 @@ async function searchCORE(query, { requireOA = true } = {}) {
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`CORE failed:`, err?.message || err);
+    return [];
+  }
 }
 
 // DOAJ (Directory of Open Access Journals) — added specifically to broaden
@@ -523,6 +543,7 @@ async function searchCORE(query, { requireOA = true } = {}) {
 // Every DOAJ-indexed article is open access by definition, so requireOA
 // never actually excludes anything here the way it can for other sources.
 async function searchDOAJ(query, { requireOA = true } = {}) {
+  try {
   const url = new URL(`https://doaj.org/api/search/articles/${encodeURIComponent(query)}`);
   url.searchParams.set("pageSize", "30");
 
@@ -558,6 +579,10 @@ async function searchDOAJ(query, { requireOA = true } = {}) {
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`DOAJ failed:`, err?.message || err);
+    return [];
+  }
 }
 
 // Crossref — the DOI registration agency itself, not a search engine built
@@ -576,6 +601,7 @@ async function searchDOAJ(query, { requireOA = true } = {}) {
 // correctly contributes nothing to an open-access-only search, the same
 // way any source would if it had no OA content to offer.
 async function searchCrossref(query, { requireOA = true } = {}) {
+  try {
   const url = new URL("https://api.crossref.org/works");
   url.searchParams.set("query", query);
   url.searchParams.set("rows", "30");
@@ -618,6 +644,10 @@ async function searchCrossref(query, { requireOA = true } = {}) {
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`Crossref failed:`, err?.message || err);
+    return [];
+  }
 }
 
 // ERIC (Education Resources Information Center) — the US Department of
@@ -631,6 +661,7 @@ async function searchCrossref(query, { requireOA = true } = {}) {
 // worth a quick look at the Render logs after this first deploys, to
 // confirm those three map as expected.
 async function searchERIC(query, { requireOA = true } = {}) {
+  try {
   const url = new URL("https://api.ies.ed.gov/eric/");
   url.searchParams.set("search", query);
   url.searchParams.set("format", "json");
@@ -667,6 +698,10 @@ async function searchERIC(query, { requireOA = true } = {}) {
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
+  } catch (err) {
+    console.error(`ERIC failed:`, err?.message || err);
+    return [];
+  }
 }
 
 
