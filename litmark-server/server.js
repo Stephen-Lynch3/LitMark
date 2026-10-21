@@ -2459,6 +2459,47 @@ function analyzeBibliography(results) {
   return { matchedCount: found.length, avgAge, notes };
 }
 
+// ---------- Citation Accuracy Score ----------
+// One 0-100% figure for how well an essay's citations hold up against
+// their real sources. Deliberately narrow: this scores citation fidelity,
+// not essay quality, and is never meant to read as a grade.
+//
+// check_failed and unable_to_verify are excluded entirely — neither is a
+// judgment on the citation itself, just LitMark being unable to reach a
+// verdict (a technical hiccup, or a source with no abstract/full text
+// available), so they're reported separately rather than counted against
+// the student either way.
+//
+// Below MIN_SCORED_CITATIONS a percentage is too noisy to mean anything
+// (one bad citation out of two swings the score by 50 points), so no
+// score is returned at all below that floor — just the raw counts.
+const MIN_SCORED_CITATIONS = 3;
+
+function computeCitationScore(results) {
+  const scored = results.filter(r =>
+    r.status === "faithful" || r.status === "overstated" ||
+    r.status === "misrepresented" || r.status === "fabricated"
+  );
+  const unresolvedCount = results.length - scored.length; // unable_to_verify + check_failed
+
+  const counts = { faithful: 0, overstated: 0, misrepresented: 0, fabricated: 0 };
+  scored.forEach(r => counts[r.status]++);
+
+  if (scored.length < MIN_SCORED_CITATIONS) {
+    return { score: null, scoredCount: scored.length, unresolvedCount, counts };
+  }
+
+  const share = 100 / scored.length;
+  let total = 0;
+  scored.forEach(r => {
+    if (r.status === "faithful") total += share;
+    else if (r.status === "fabricated") total -= share;
+    else total -= share / 2; // overstated or misrepresented
+  });
+
+  return { score: Math.max(0, Math.round(total)), scoredCount: scored.length, unresolvedCount, counts };
+}
+
 // Shared by both the paste route and the file-upload route — everything
 // after "we have plain essay text" is identical either way.
 async function auditEssayText(essayText, folderPapers = null) {
@@ -2497,7 +2538,8 @@ async function auditEssayText(essayText, folderPapers = null) {
 
   console.log(`[audit] verified ${results.length} citations`);
   const bibliography = analyzeBibliography(results);
-  return { results, bibliography };
+  const citationScore = computeCitationScore(results);
+  return { results, bibliography, citationScore };
 }
 
 // The student's own browser sends these straight from a folder already in
