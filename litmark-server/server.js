@@ -2579,9 +2579,100 @@ async function analyzeConsistency(results) {
   return checked.filter(c => c.status === "conflict");
 }
 
+// ---------- Evidence balance: has the essay ignored real counter-evidence? ----------
+// For & against already runs a two-angle search (buildCounterQuery + the
+// same multi-source fan-out) for a question the student types in. This
+// reuses that exact machinery, but points the counter-angle half of it at
+// the essay's OWN apparent thesis, and asks whether the essay engages with
+// what a neutral search turns up on the other side of it — not whether a
+// specific paper is cited, since the student may have engaged with the
+// same complication via a different source entirely. Only flags a genuine,
+// readily-findable gap; if no real counter-evidence turns up, or the essay
+// already addresses the kind that does, this stays silent.
+
+// A one-line thesis the student didn't have to type in themselves — only
+// called when the route wasn't given one already (the folder's own
+// research question, when there is one, is more accurate than a guess).
+async function deriveResearchQuestion(essayText) {
+  const prompt = `Read this essay excerpt and state, in ONE sentence, the core research question or thesis it argues for or investigates — specific and concrete, not "the author discusses X".
+
+Essay excerpt:
+"""
+${essayText.slice(0, 6000)}
+"""
+
+Respond with ONLY the one-sentence question or thesis, nothing else.`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 150,
+    temperature: 0,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const text = (msg.content.find(b => b.type === "text")?.text || "").trim();
+  return text.replace(/^["']|["']$/g, "").slice(0, 500) || null;
+}
+
+async function findUnaddressedCounterEvidence(essayText, researchQuestion) {
+  if (!researchQuestion) return null;
+
+  const counterQuery = await buildCounterQuery(researchQuestion);
+  const oaOpts = { requireOA: true };
+  const fetches = await Promise.allSettled([
+    searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts),
+    searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts),
+    searchDOAJ(counterQuery, oaOpts), searchCrossref(counterQuery, oaOpts), searchERIC(counterQuery, oaOpts)
+  ]);
+  const raw = fetches.flatMap(f => f.status === "fulfilled" ? f.value : []);
+  const found = dedupe(requireTermMatch(raw, [counterQuery]));
+  if (found.length === 0) return null; // nothing real to flag against
+
+  const highlighted = await highlightPapers(researchQuestion, interleaveBySource(found).slice(0, 15));
+  const candidates = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1)).slice(0, 5);
+  if (candidates.length === 0) return null;
+
+  const prompt = `A student's essay argues the following:
+QUESTION/THESIS: "${researchQuestion}"
+
+Here is the essay text:
+"""
+${essayText.slice(0, 12000)}
+"""
+
+Here are real, credible papers a neutral search found that complicate or challenge this thesis:
+${candidates.map((p, i) => `${i + 1}. "${p.title}" (${p.year || "n.d."}) — ${(p.highlights?.[0]?.text || p.abstract || "").slice(0, 300)}`).join("\n")}
+
+Does the essay already engage with this kind of counter-evidence somewhere — even via different sources making a similar complicating point — or does it appear to argue its thesis without addressing any substantial challenge to it?
+
+Respond with ONLY JSON, nothing else:
+{"engaged": true | false, "explanation": "one short plain sentence"}`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 250,
+    temperature: 0,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const rawText = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = rawText.replace(/```json|```/g, "").trim();
+  let parsed;
+  try { parsed = JSON.parse(clean); } catch { return null; } // a technical hiccup, not a judgment — stay silent rather than guess
+
+  if (parsed?.engaged === true) return null; // already engages — nothing to flag
+
+  return {
+    researchQuestion,
+    explanation: (parsed?.explanation || "").toString().trim().slice(0, 500),
+    papers: candidates.slice(0, 3).map(p => ({
+      title: p.title, year: p.year, authors: p.authors, journal: p.journal,
+      url: p.oaUrl || null, highlight: p.highlights?.[0]?.text || null
+    }))
+  };
+}
+
 // Shared by both the paste route and the file-upload route — everything
 // after "we have plain essay text" is identical either way.
-async function auditEssayText(essayText, folderPapers = null) {
+async function auditEssayText(essayText, folderPapers = null, researchQuestion = null) {
   const citations = await extractCitations(essayText);
   console.log(`[audit] extracted ${citations.length} citations${folderPapers ? `, matching against ${folderPapers.length} folder source(s) first` : ""}`);
 
@@ -2620,7 +2711,20 @@ async function auditEssayText(essayText, folderPapers = null) {
   const citationScore = computeCitationScore(results);
   const consistency = await analyzeConsistency(results);
   if (consistency.length) console.log(`[audit] found ${consistency.length} source(s) cited inconsistently`);
-  return { results, bibliography, citationScore, consistency };
+
+  // Best-effort: a failure here (search outage, a bad model response) is
+  // never allowed to break the citation audit the student actually asked
+  // for, so it's wrapped and logged rather than thrown.
+  let evidenceBalance = null;
+  try {
+    const question = researchQuestion || await deriveResearchQuestion(essayText);
+    evidenceBalance = await findUnaddressedCounterEvidence(essayText, question);
+    if (evidenceBalance) console.log(`[audit] found unaddressed counter-evidence for "${question}"`);
+  } catch (err) {
+    console.error("[audit] evidence balance check failed:", err.message);
+  }
+
+  return { results, bibliography, citationScore, consistency, evidenceBalance };
 }
 
 // The student's own browser sends these straight from a folder already in
@@ -2649,9 +2753,13 @@ app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
   if (essayText.length > 100000) return res.status(400).json({ error: "Essay too long — 100,000 characters max (around 15,000 words)" });
   const folderPapers = sanitizeFolderPapers(req.body.folderPapers);
+  // Optional: the folder's own research question, when this essay was
+  // audited from a folder that has one — more accurate than guessing the
+  // thesis from the essay text, so used ahead of that fallback when given.
+  const researchQuestion = (req.body.researchQuestion || "").toString().trim().slice(0, 500) || null;
 
   try {
-    res.json(await auditEssayText(essayText, folderPapers));
+    res.json(await auditEssayText(essayText, folderPapers, researchQuestion));
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Couldn't complete the citation audit right now — try again in a moment.", detail: err.message });
@@ -2719,9 +2827,10 @@ app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"
   if (req.body.folderPapers) {
     try { folderPapers = sanitizeFolderPapers(JSON.parse(req.body.folderPapers)); } catch { folderPapers = null; }
   }
+  const researchQuestion = (req.body.researchQuestion || "").toString().trim().slice(0, 500) || null;
 
   try {
-    const result = await auditEssayText(essayText, folderPapers);
+    const result = await auditEssayText(essayText, folderPapers, researchQuestion);
     res.json({ ...result, extractedLength: essayText.length });
   } catch (err) {
     console.error(err);
