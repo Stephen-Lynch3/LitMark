@@ -2500,6 +2500,85 @@ function computeCitationScore(results) {
   return { score: Math.max(0, Math.round(total)), scoredCount: scored.length, unresolvedCount, counts };
 }
 
+// ---------- Consistency check: same source cited more than once ----------
+// Reuses citations already extracted and verified above — no new
+// extraction pass, just a second look at claims that are already in hand.
+// Groups citations by the paper they actually resolved to (matchedTitle,
+// not the raw in-text citation text — the same source can be written
+// "(Smith, 2015)" one time and "Smith (2015) also..." another), and for
+// any source cited 2+ times, asks whether the claims attached to each
+// mention genuinely agree. Deliberately silent unless there's a real
+// conflict: most repeat citations are perfectly consistent, and a
+// confirmation card for every one of them would just be noise on top of
+// everything else the audit already reports.
+function normaliseTitle(title) {
+  return (title || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function groupBySource(results) {
+  const groups = new Map();
+  for (const r of results) {
+    if (!r.matchedTitle) continue; // nothing to group an unresolved citation against
+    const key = normaliseTitle(r.matchedTitle);
+    if (!key) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(r);
+  }
+  return [...groups.values()].filter(g => g.length >= 2);
+}
+
+async function checkConsistency(claims) {
+  const list = claims.map((c, i) => `${i + 1}. "${c.claim}"`).join("\n");
+  const prompt = `A student's essay cites the same source more than once. Here are the claims attached to each mention, in the order they appear:
+
+${list}
+
+Do these claims genuinely conflict — pointing in different directions, or one contradicting what another implies the source found — or are they consistent (different details from the same source, or the same point made more than once)? Minor differences in wording or emphasis are NOT a conflict; only flag a real contradiction between what the claims say.
+
+Respond with ONLY JSON, nothing else:
+{"status": "consistent" | "conflict", "explanation": "one short plain sentence naming what conflicts — only meaningful when status is conflict"}`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 200,
+    temperature: 0, // judgment task — the same pair of claims should get the same read every time
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  try {
+    const parsed = JSON.parse(clean);
+    const status = parsed.status === "conflict" ? "conflict" : "consistent";
+    return { status, explanation: status === "conflict" ? (parsed.explanation || "").toString().trim().slice(0, 500) : "" };
+  } catch {
+    // A technical hiccup, not a judgment — stay silent rather than guess.
+    return { status: "check_failed", explanation: "" };
+  }
+}
+
+async function analyzeConsistency(results) {
+  const groups = groupBySource(results);
+  if (groups.length === 0) return [];
+
+  const checked = await mapWithConcurrency(groups, 5, async (group) => {
+    const verdict = await checkConsistency(group.map(r => ({ claim: r.claim, citationText: r.citationText })))
+      .catch(() => ({ status: "check_failed", explanation: "" }));
+    return {
+      source: group[0].matchedTitle,
+      authors: group[0].matchedAuthors,
+      year: group[0].matchedYear,
+      claims: group.map(r => ({ claim: r.claim, citationText: r.citationText })),
+      status: verdict.status,
+      explanation: verdict.explanation
+    };
+  });
+
+  // Only surface genuine conflicts — consistent repeats and technical
+  // hiccups both stay silent, same "don't confirm, only flag" principle
+  // as the rest of the audit.
+  return checked.filter(c => c.status === "conflict");
+}
+
 // Shared by both the paste route and the file-upload route — everything
 // after "we have plain essay text" is identical either way.
 async function auditEssayText(essayText, folderPapers = null) {
@@ -2539,7 +2618,9 @@ async function auditEssayText(essayText, folderPapers = null) {
   console.log(`[audit] verified ${results.length} citations`);
   const bibliography = analyzeBibliography(results);
   const citationScore = computeCitationScore(results);
-  return { results, bibliography, citationScore };
+  const consistency = await analyzeConsistency(results);
+  if (consistency.length) console.log(`[audit] found ${consistency.length} source(s) cited inconsistently`);
+  return { results, bibliography, citationScore, consistency };
 }
 
 // The student's own browser sends these straight from a folder already in
