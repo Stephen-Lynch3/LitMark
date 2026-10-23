@@ -2133,7 +2133,20 @@ async function lookupPaper({ guessTitle, guessAuthor, guessYear, guessDoi }) {
   let best = null, bestScore = 0;
   for (const c of candidates) {
     let score = titleSimilarity(guessTitle, c.title);
-    if (guessYear && c.year === guessYear) score += 0.15;
+    if (guessYear && c.year === guessYear) {
+      score += 0.15;
+    } else if (guessYear && c.year) {
+      // A real match should have been published close to the year the
+      // citation claims. Word-overlap title similarity alone can't tell a
+      // paper from a much later one that shares most of its title ("X" vs
+      // "Replicating X", "Revisiting X", "A new look at X") — exactly the
+      // kind of near-superset title a follow-up or replication study has.
+      // A large year gap is strong evidence it's the wrong paper, not just
+      // a tie-breaker to leave unused. Capped so a plausible 1-2 year
+      // publication-date discrepancy isn't punished.
+      const yearGap = Math.abs(c.year - guessYear);
+      if (yearGap > 2) score -= Math.min(0.5, yearGap * 0.03);
+    }
     if (score > bestScore) { bestScore = score; best = c; }
   }
 
@@ -2198,12 +2211,22 @@ function crossrefItem(it) {
 // between is 'ambiguous', which is never treated as proof of fabrication.
 function judgeCrossrefMatches(items, { title, author, year }) {
   const surname = String(author || "").toLowerCase().replace(/[^a-z\s'-]/g, "").trim().split(/\s+/).pop();
-  let best = null, bestSim = 0;
+  // Select the candidate with a year-aware score (same reasoning as
+  // lookupPaper: pure title overlap alone can't tell a paper from a much
+  // later one sharing most of its title), but keep the threshold checks
+  // below working on the winning candidate's plain title similarity, so
+  // the existing 0.6/0.45/0.3 calibration doesn't need re-tuning.
+  let best = null, bestSelectScore = -Infinity;
   for (const it of items) {
-    const sim = titleSimilarity(title, it.title);
-    if (sim > bestSim) { bestSim = sim; best = it; }
+    let selectScore = titleSimilarity(title, it.title);
+    if (year && it.year) {
+      const yearGap = Math.abs(it.year - year);
+      if (yearGap > 2) selectScore -= Math.min(0.5, yearGap * 0.03);
+    }
+    if (selectScore > bestSelectScore) { bestSelectScore = selectScore; best = it; }
   }
   if (!best) return { status: "none" };
+  const bestSim = titleSimilarity(title, best.title);
   const yearOk = !!(year && best.year && Math.abs(best.year - year) <= 1);
   const authorOk = !!(surname && best.authors && best.authors.toLowerCase().includes(surname));
   if (bestSim >= 0.6 || (bestSim >= 0.45 && (yearOk || authorOk))) return { status: "found", item: best, similarity: bestSim };
@@ -2267,7 +2290,15 @@ function matchFolderPaper(c, folderPapers) {
   for (const p of folderPapers) {
     if (!p || !p.title) continue;
     let score = titleSimilarity(c.guessTitle, p.title);
-    if (c.guessYear && Number(p.year) === Number(c.guessYear)) score += 0.15;
+    const pYear = Number(p.year);
+    if (c.guessYear && pYear === Number(c.guessYear)) {
+      score += 0.15;
+    } else if (c.guessYear && Number.isFinite(pYear)) {
+      // Same reasoning as lookupPaper's scoring: a large year gap is real
+      // evidence against a match, not just a missed bonus.
+      const yearGap = Math.abs(pYear - Number(c.guessYear));
+      if (yearGap > 2) score -= Math.min(0.5, yearGap * 0.03);
+    }
     if (score > bestScore) { bestScore = score; best = p; }
   }
   if (bestScore < 0.35) return null;
