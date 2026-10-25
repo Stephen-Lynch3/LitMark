@@ -30,6 +30,7 @@ import jwt from "jsonwebtoken";
 import { Resend } from "resend";
 import multer from "multer";
 import mammoth from "mammoth";
+import pg from "pg";
 import { randomUUID, randomBytes } from "crypto";
 import "dotenv/config";
 
@@ -79,6 +80,41 @@ async function createMessageWithRetry(params, retries = 2, delayMs = 800) {
 // (not a server crash) until real keys are set.
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || "sk_test_not_configured_yet");
 const resend = new Resend(process.env.RESEND_API_KEY || "re_not_configured_yet");
+
+// ---------- Saved folders, persisted per account ----------
+// Everything else in this app (search results, citation audits) is
+// computed fresh each time and never needs to outlive the request, so it
+// was never a gap that we kept "no separate database of subscribers to
+// keep in sync" (see the top of this file) — Stripe stays the sole source
+// of truth for who's a subscriber. But a student's saved folders of
+// sources are work they build up over weeks, and until now those only
+// lived in that one browser's localStorage: clear the cache, switch
+// devices, or use a library PC, and they're gone. This is the one place
+// we now keep our own small database — just the folders, keyed by email,
+// nothing else.
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const dbPool = DATABASE_URL
+  ? new pg.Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+if (!dbPool) {
+  console.warn("[startup] WARNING: DATABASE_URL is not set. Saved folders will not sync across devices or survive a browser cache-clear until it is — set DATABASE_URL on Render to a Postgres connection string (Neon and Supabase both have a free tier).");
+}
+async function ensureLibrarySchema() {
+  if (!dbPool) return;
+  try {
+    await dbPool.query(`
+      CREATE TABLE IF NOT EXISTS library (
+        email TEXT PRIMARY KEY,
+        folders JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+    console.log("[startup] library table ready");
+  } catch (err) {
+    console.error("[startup] could not set up the library table — saved-folder sync is disabled until this is fixed:", err.message);
+  }
+}
+ensureLibrarySchema();
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
 // OpenAlex's free daily credit allowance without a key is small and shared
@@ -1586,6 +1622,39 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Could not open billing portal", detail: err.message });
+  }
+});
+
+// ---------- Saved folders (account-based, not browser-based) ----------
+// GET returns what the server has for this email; the frontend treats
+// this as the source of truth on login/page load and overwrites its local
+// cache with it. PUT replaces the whole folder list, same shape localStorage
+// used — simplest possible contract, no per-folder diffing to get wrong.
+app.get("/api/library", requireAuth, async (req, res) => {
+  if (!dbPool) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
+  try {
+    const { rows } = await dbPool.query("SELECT folders FROM library WHERE email = $1", [req.email]);
+    res.json({ folders: rows[0]?.folders ?? null }); // null = "server has nothing yet", distinct from "[]" = "server has an empty library"
+  } catch (err) {
+    console.error("[library] load failed:", err.message);
+    res.status(502).json({ error: "Could not load saved folders" });
+  }
+});
+
+app.put("/api/library", requireAuth, async (req, res) => {
+  if (!dbPool) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
+  const folders = req.body?.folders;
+  if (!Array.isArray(folders)) return res.status(400).json({ error: "Body must be { folders: [...] }" });
+  try {
+    await dbPool.query(
+      `INSERT INTO library (email, folders, updated_at) VALUES ($1, $2, now())
+       ON CONFLICT (email) DO UPDATE SET folders = $2, updated_at = now()`,
+      [req.email, JSON.stringify(folders)]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[library] save failed:", err.message);
+    res.status(502).json({ error: "Could not save folders" });
   }
 });
 
