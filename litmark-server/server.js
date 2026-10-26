@@ -2444,7 +2444,7 @@ function existenceVerdict(res, c, searched = searchedDatabases()) {
 }
 
 // ---------- Is the claim faithful to the source? ----------
-const VERDICTS = ["faithful", "overstated", "misrepresented", "unable_to_verify"];
+const VERDICTS = ["faithful", "overstated", "misrepresented", "unable_to_verify", "not_original_source"];
 
 function buildVerifyPrompt(claim, paper, extra = null) {
   const excerpts = extra
@@ -2457,11 +2457,12 @@ Here is everything LitMark can read of that source:
 ABSTRACT: "${paper.abstract}"${excerpts}
 
 Does what's available genuinely support the claim as written? Respond with ONLY JSON, nothing else:
-{"status": "faithful" | "overstated" | "misrepresented" | "unable_to_verify", "explanation": "one short plain sentence"}
-- faithful: what's available clearly supports the claim as written
+{"status": "faithful" | "overstated" | "misrepresented" | "unable_to_verify" | "not_original_source", "explanation": "one short plain sentence", "originalSourceHint": {"author": "string or null", "year": number or null, "title": "string or null"} | null}
+- faithful: what's available clearly supports the claim as written, AND this paper is reporting the finding as its own original work
 - overstated: the source points the same way, but the claim says MORE than it shows: stronger certainty (e.g. the source says "may suggest", the claim says "proves"), causation from a correlation, a wider group or setting than was studied, or a bigger effect than was reported
 - misrepresented: the claim says something the source doesn't support, contradicts or reverses, or the source is about a different topic altogether (a real paper that doesn't say this)
 - unable_to_verify: the claim depends on a detail that isn't in the text available (a specific figure, method, sample size or passage that only the full paper would show), so it can be neither confirmed nor refuted. Use this ONLY when the available text genuinely lacks the detail. If it clearly supports or contradicts the claim, choose one of the other three.
+- not_original_source: the claim IS genuinely supported by this text, but this text is itself attributing the finding to earlier or other research rather than reporting it as this paper's own — a review, meta-analysis, or an introduction/discussion section citing prior work (telltale phrasing: "X et al. (Year) showed...", "consistent with earlier findings that...", "as previously demonstrated by..."). This is a student citing a middleman instead of the actual source. If the text names the earlier work (an author, a year, anything identifying it), fill in "originalSourceHint" with whatever you can extract; otherwise leave it null. Use this only when the text clearly signals it is relaying someone else's finding, not just because other researchers are mentioned in passing.
 Judge only from the text above. Do not assume what the rest of the paper says.`;
 }
 
@@ -2481,12 +2482,25 @@ async function verifyCitation(claim, paper, extra = null) {
     const parsed = JSON.parse(clean);
     const status = parsed.status === "unrelated" ? "misrepresented" : parsed.status; // tolerate the old label
     if (!VERDICTS.includes(status)) throw new Error("unexpected status");
-    return { status, explanation: parsed.explanation || "" };
+    const hint = parsed.originalSourceHint;
+    const originalSourceHint = (hint && (hint.title || hint.author || hint.year))
+      ? { title: hint.title || null, author: hint.author || null, year: typeof hint.year === "number" ? hint.year : null }
+      : null;
+    return { status, explanation: parsed.explanation || "", originalSourceHint };
   } catch {
     // Found the real source (we have its abstract) but something went wrong
     // producing a verdict this time — a technical hiccup, not a judgment.
     return { status: "check_failed", explanation: "Found the source, but couldn't produce a clear verdict this time. Try again, or check it manually." };
   }
+}
+
+// Turns the AI's best-guess attribution ({author, year, title}) into one
+// readable line for a student who can't look the real source up themselves.
+function formatSourceHint(hint) {
+  if (!hint) return null;
+  const who = hint.author ? hint.author + (hint.year ? ` (${hint.year})` : "") : (hint.year ? `${hint.year}` : null);
+  if (who && hint.title) return `${who} — "${hint.title}"`;
+  return who || hint.title || null;
 }
 
 // One citation, start to finish. If the abstract alone can't settle the
@@ -2516,7 +2530,18 @@ async function checkCitation(c, deps = defaultDeps(), folderPapers = null) {
   if (res.doiState === "no") notes.push("The DOI in your reference list isn't registered, so check it for typos.");
   if (paper.retracted) notes.push("This paper has been retracted, so it shouldn't be relied on as evidence.");
   if (notes.length) verdict = { ...verdict, explanation: `${verdict.explanation} ${notes.join(" ")}`.trim() };
-  return { paper, meta: null, ...verdict, checkedAgainst, fromFolder: !!res.fromFolder };
+
+  let primarySource = null;
+  if (verdict.status === "not_original_source" && verdict.originalSourceHint) {
+    const hint = verdict.originalSourceHint;
+    try {
+      primarySource = await deps.lookupPaper({ guessTitle: hint.title, guessAuthor: hint.author, guessYear: hint.year });
+    } catch (err) {
+      console.error("[audit] primary-source lookup failed:", err.message);
+    }
+  }
+
+  return { paper, meta: null, ...verdict, primarySource, checkedAgainst, fromFolder: !!res.fromFolder };
 }
 
 // Process citations in small concurrent batches rather than all at once —
@@ -2810,7 +2835,15 @@ async function auditEssayText(essayText, folderPapers = null, researchQuestion =
       matchedFromFolder: !!checked.fromFolder,
       checkedAgainst: checked.checkedAgainst,
       status: checked.status,
-      explanation: checked.explanation
+      explanation: checked.explanation,
+      primarySource: checked.primarySource ? {
+        title: checked.primarySource.title || null,
+        url: checked.primarySource.oaUrl || null,
+        journal: checked.primarySource.journal || null,
+        year: checked.primarySource.year || null,
+        authors: checked.primarySource.authors || null
+      } : null,
+      originalSourceHint: checked.primarySource ? null : formatSourceHint(checked.originalSourceHint)
     };
   });
 
