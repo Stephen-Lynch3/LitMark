@@ -964,7 +964,15 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
         })
         .filter(h => h.text && sourceFor(h.section) && sourceFor(h.section).includes(h.text))
         .slice(0, 2);
-      if (highlights.length === 0) return null; // no genuinely locatable highlight = not included
+      // A paper the model judged worth scoring (it's in the response at
+      // all) still surfaces even when every quote it offered fails the
+      // exact-match check above — that's a quoting failure (paraphrased
+      // instead of verbatim, or a stray character), not evidence the paper
+      // isn't relevant. It's shown with its full abstract and Suitability
+      // score, just without a highlighted sentence, rather than
+      // disappearing outright. A paper is only excluded when the model
+      // never mentioned its index at all — the prompt's own instruction
+      // for one it judged genuinely irrelevant.
 
       const relevance = clampScore(s.relevance);
       const accuracy = clampScore(s.accuracy);
