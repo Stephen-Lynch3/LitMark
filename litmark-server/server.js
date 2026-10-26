@@ -2613,24 +2613,35 @@ function computeCitationScore(results) {
     r.status === "faithful" || r.status === "overstated" ||
     r.status === "misrepresented" || r.status === "fabricated"
   );
-  const unresolvedCount = results.length - scored.length; // unable_to_verify + check_failed
+  // not_original_source is deliberately excluded from the score itself — it's
+  // a citation-practice issue (cite the primary source instead), not a
+  // faithfulness violation, so it shouldn't drag accuracy down the way
+  // misrepresented/fabricated do. But it WAS successfully checked, so it
+  // must not be folded into unresolvedCount either — that bucket means
+  // "we couldn't verify this," which isn't true here. Tracked separately so
+  // callers can tell the two apart instead of silently conflating them.
+  const notOriginalSourceCount = results.filter(r => r.status === "not_original_source").length;
+  const unresolvedCount = results.length - scored.length - notOriginalSourceCount; // unable_to_verify + check_failed
 
   const counts = { faithful: 0, overstated: 0, misrepresented: 0, fabricated: 0 };
   scored.forEach(r => counts[r.status]++);
 
   if (scored.length < MIN_SCORED_CITATIONS) {
-    return { score: null, scoredCount: scored.length, unresolvedCount, counts };
+    return { score: null, scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, counts };
   }
 
-  const share = 100 / scored.length;
-  let total = 0;
-  scored.forEach(r => {
-    if (r.status === "faithful") total += share;
-    else if (r.status === "fabricated") total -= share;
-    else total -= share / 2; // overstated or misrepresented
-  });
+  // Each citation is scored on its own 0-100 scale and averaged, rather than
+  // summing signed weights that can go negative and get floored at 0. That
+  // older approach could erase a genuinely faithful citation from the score
+  // entirely: one good citation outweighed by a few bad ones nets negative,
+  // clamps to 0%, and "0% accuracy" then sits right next to a visible
+  // Faithful badge — a contradiction a reader shouldn't have to do the
+  // underlying math to resolve. Averaging per-citation points means the
+  // score only reaches 0% when every scored citation actually earned zero.
+  const POINTS = { faithful: 100, overstated: 50, misrepresented: 0, fabricated: 0 };
+  const total = scored.reduce((sum, r) => sum + POINTS[r.status], 0);
 
-  return { score: Math.max(0, Math.round(total)), scoredCount: scored.length, unresolvedCount, counts };
+  return { score: Math.round(total / scored.length), scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, counts };
 }
 
 // ---------- Consistency check: same source cited more than once ----------
