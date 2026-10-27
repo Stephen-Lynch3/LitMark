@@ -2137,7 +2137,15 @@ async function findByDoiDirect(doi) {
     const res = await fetchWithRetry(url);
     if (res.ok) {
       const w = await res.json();
-      if (w && w.abstract_inverted_index) {
+      // Don't require an abstract here: identity is already certain from the
+      // DOI, so there's no fuzzy-match risk in returning this record even if
+      // Crossref/OpenAlex has no abstract for it (some major publishers,
+      // The Lancet/Elsevier among them, withhold abstracts entirely,
+      // independent of retraction status). An empty abstract still means
+      // "unable to verify the claim's wording", but metadata we DO have —
+      // title, journal, and critically is_retracted — would otherwise be
+      // discarded along with it, silently skipping the retraction check.
+      if (w && (w.id || w.title)) {
         const oaLink = w.open_access?.oa_url || w.primary_location?.pdf_url
           || (w.open_access?.is_oa && w.doi ? w.doi : null);
         return {
