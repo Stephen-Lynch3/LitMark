@@ -2350,7 +2350,7 @@ async function fullTextExcerpts(paper) {
 }
 
 const searchedDatabases = () => ["OpenAlex", "Semantic Scholar", "Europe PMC", ...(process.env.CORE_API_KEY ? ["CORE"] : []), "Crossref"];
-const defaultDeps = () => ({ lookupPaper, doiRegistration, crossrefLookup, verifyCitation, fullTextExcerpts });
+const defaultDeps = () => ({ lookupPaper, doiRegistration, crossrefLookup, verifyCitation, fullTextExcerpts, findDebunkingPaper });
 
 // Works out whether the cited source exists, and if so whether there's an
 // abstract to check the claim against.
@@ -2503,6 +2503,68 @@ function formatSourceHint(hint) {
   return who || hint.title || null;
 }
 
+// ---------- Has this source been debunked since publication? ----------
+// A citation can be a perfectly faithful, accurate read of a source that has
+// itself since been overturned — the student did nothing wrong, the field
+// just moved on after they cited it. One extra search (reusing the same
+// databases lookupPaper already searches) plus one judgment call, scoped
+// deliberately narrow: only a later-published paper that directly and
+// substantively overturns THIS paper's own finding counts — not a related
+// topic, not a partial qualification, not a different angle on the same
+// subject. Only ever called on a citation that was otherwise faithful or
+// overstated; a citation already fabricated or misrepresented has a bigger
+// problem than whether its (wrongly-used) source later held up.
+async function findDebunkingPaper(paper, claim) {
+  if (!paper.title) return null;
+  const firstAuthor = (paper.authors || "").split(",")[0]?.trim() || "";
+  const query = `${paper.title} ${firstAuthor} failed to replicate OR debunked OR does not replicate OR retraction OR challenges`.trim();
+
+  const results = await Promise.allSettled([
+    searchOpenAlex(query, { requireOA: false }),
+    searchSemanticScholar(query, { requireOA: false }),
+    searchCrossref(query, { requireOA: false })
+  ]);
+  const candidates = dedupe(results.flatMap(r => r.status === "fulfilled" ? r.value : []))
+    .filter(c => c.title && c.abstract && typeof c.year === "number" && typeof paper.year === "number" && c.year > paper.year)
+    .sort((a, b) => (b.citedByCount || 0) - (a.citedByCount || 0))
+    .slice(0, 5);
+  if (candidates.length === 0) return null;
+
+  const list = candidates.map((c, i) => `${i + 1}. "${c.title}" (${c.year}) — ${c.abstract}`).join("\n\n");
+  const prompt = `A student cited this paper:
+ORIGINAL PAPER: "${paper.title}" (${paper.year})
+ORIGINAL ABSTRACT: "${paper.abstract}"
+
+Here are later papers that may discuss it:
+
+${list}
+
+Does ANY of these directly and substantively overturn, debunk, retract, or fail to replicate the ORIGINAL paper's own finding — not just a related topic, a partial qualification, or a different angle on the same subject? Respond with ONLY JSON, nothing else:
+{"debunked": true | false, "index": number or null, "explanation": "one short plain sentence naming what the later paper found, only when debunked is true"}`;
+
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 200,
+    temperature: 0,
+    messages: [{ role: "user", content: prompt }]
+  });
+  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
+  const clean = raw.replace(/```json|```/g, "").trim();
+  try {
+    const parsed = JSON.parse(clean);
+    if (!parsed.debunked || typeof parsed.index !== "number") return null;
+    const hit = candidates[parsed.index - 1];
+    if (!hit) return null;
+    return {
+      title: hit.title, year: hit.year, authors: hit.authors,
+      journal: hit.journal, oaUrl: hit.oaUrl || toDoiUrl(hit.doi),
+      explanation: parsed.explanation || ""
+    };
+  } catch {
+    return null; // a technical hiccup here just means no debunked flag, never a false one
+  }
+}
+
 // One citation, start to finish. If the abstract alone can't settle the
 // claim, and the full text happens to be readable (open-access papers on
 // Europe PMC), read that too before giving up — so "unable to verify" means
@@ -2526,10 +2588,9 @@ async function checkCitation(c, deps = defaultDeps(), folderPapers = null) {
     }
     if (verdict.status === "unable_to_verify") verdict = { ...verdict, explanation: `${verdict.explanation} Only the abstract was available to read.`.trim() };
   }
-  const notes = [];
-  if (res.doiState === "no") notes.push("The DOI in your reference list isn't registered, so check it for typos.");
-  if (paper.retracted) notes.push("This paper has been retracted, so it shouldn't be relied on as evidence.");
-  if (notes.length) verdict = { ...verdict, explanation: `${verdict.explanation} ${notes.join(" ")}`.trim() };
+  if (res.doiState === "no") {
+    verdict = { ...verdict, explanation: `${verdict.explanation} The DOI in your reference list isn't registered, so check it for typos.`.trim() };
+  }
 
   let primarySource = null;
   if (verdict.status === "not_original_source" && verdict.originalSourceHint) {
@@ -2541,7 +2602,26 @@ async function checkCitation(c, deps = defaultDeps(), folderPapers = null) {
     }
   }
 
-  return { paper, meta: null, ...verdict, primarySource, checkedAgainst, fromFolder: !!res.fromFolder };
+  // Outright retraction always wins, no matter what the citation claims —
+  // a retracted paper isn't evidence of anything. Otherwise, only a
+  // citation that was already faithful or overstated is worth spending a
+  // search and a judgment call on, to see whether a later paper has since
+  // overturned it.
+  let debunkedBy = null;
+  if (paper.retracted) {
+    verdict = { status: "debunked", explanation: "This paper has been formally retracted, so it shouldn't be relied on as evidence." };
+  } else if (verdict.status === "faithful" || verdict.status === "overstated") {
+    try {
+      debunkedBy = await deps.findDebunkingPaper(paper, c.claim);
+    } catch (err) {
+      console.error("[audit] debunked-check failed:", err.message);
+    }
+    if (debunkedBy) {
+      verdict = { status: "debunked", explanation: `This finding has since been directly challenged: ${debunkedBy.explanation}` };
+    }
+  }
+
+  return { paper, meta: null, ...verdict, primarySource, debunkedBy, checkedAgainst, fromFolder: !!res.fromFolder };
 }
 
 // Process citations in small concurrent batches rather than all at once —
@@ -2613,21 +2693,25 @@ function computeCitationScore(results) {
     r.status === "faithful" || r.status === "overstated" ||
     r.status === "misrepresented" || r.status === "fabricated"
   );
-  // not_original_source is deliberately excluded from the score itself — it's
-  // a citation-practice issue (cite the primary source instead), not a
-  // faithfulness violation, so it shouldn't drag accuracy down the way
-  // misrepresented/fabricated do. But it WAS successfully checked, so it
-  // must not be folded into unresolvedCount either — that bucket means
-  // "we couldn't verify this," which isn't true here. Tracked separately so
-  // callers can tell the two apart instead of silently conflating them.
+  // not_original_source and debunked are both deliberately excluded from the
+  // score itself. not_original_source is a citation-practice issue (cite the
+  // primary source instead), not a faithfulness violation. debunked is even
+  // clearer-cut: the citation was an accurate read of its source at the time
+  // — the source itself just didn't hold up since. Neither is the student's
+  // fault in the way misrepresented/fabricated are, so neither should drag
+  // accuracy down. But both WERE successfully checked, so neither belongs in
+  // unresolvedCount either — that bucket means "we couldn't verify this,"
+  // which isn't true for either case. All three are tracked separately so
+  // callers can tell them apart instead of silently conflating them.
   const notOriginalSourceCount = results.filter(r => r.status === "not_original_source").length;
-  const unresolvedCount = results.length - scored.length - notOriginalSourceCount; // unable_to_verify + check_failed
+  const debunkedCount = results.filter(r => r.status === "debunked").length;
+  const unresolvedCount = results.length - scored.length - notOriginalSourceCount - debunkedCount; // unable_to_verify + check_failed
 
   const counts = { faithful: 0, overstated: 0, misrepresented: 0, fabricated: 0 };
   scored.forEach(r => counts[r.status]++);
 
   if (scored.length < MIN_SCORED_CITATIONS) {
-    return { score: null, scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, counts };
+    return { score: null, scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, debunkedCount, counts };
   }
 
   // Each citation is scored on its own 0-100 scale and averaged, rather than
@@ -2641,7 +2725,7 @@ function computeCitationScore(results) {
   const POINTS = { faithful: 100, overstated: 50, misrepresented: 0, fabricated: 0 };
   const total = scored.reduce((sum, r) => sum + POINTS[r.status], 0);
 
-  return { score: Math.round(total / scored.length), scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, counts };
+  return { score: Math.round(total / scored.length), scoredCount: scored.length, unresolvedCount, notOriginalSourceCount, debunkedCount, counts };
 }
 
 // ---------- Consistency check: same source cited more than once ----------
@@ -2854,7 +2938,14 @@ async function auditEssayText(essayText, folderPapers = null, researchQuestion =
         year: checked.primarySource.year || null,
         authors: checked.primarySource.authors || null
       } : null,
-      originalSourceHint: checked.primarySource ? null : formatSourceHint(checked.originalSourceHint)
+      originalSourceHint: checked.primarySource ? null : formatSourceHint(checked.originalSourceHint),
+      debunkedBy: checked.debunkedBy ? {
+        title: checked.debunkedBy.title || null,
+        url: checked.debunkedBy.oaUrl || null,
+        journal: checked.debunkedBy.journal || null,
+        year: checked.debunkedBy.year || null,
+        authors: checked.debunkedBy.authors || null
+      } : null
     };
   });
 
