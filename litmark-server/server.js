@@ -37,9 +37,12 @@ import {
   sanitizeFoldersForAsk, sanitizeAskHistory, formatHistoryBlock, pickDetailPapers,
   buildVeraSystemPrompt, buildVeraUserContent, parseModelJson, finaliseVeraAnswer
 } from "./vera-context.js";
-import { dedupePapers, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
+import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
 import { createResponseCache, searchCacheKey } from "./response-cache.js";
+import { createLibraryStore } from "./library-store.js";
+import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
 import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
+import { createOfficialData } from "./official-data.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -119,19 +122,16 @@ const dbPool = DATABASE_URL
 if (!dbPool) {
   console.warn("[startup] WARNING: DATABASE_URL is not set. Saved folders will not sync across devices or survive a browser cache-clear until it is — set DATABASE_URL on Render to a Postgres connection string (Neon and Supabase both have a free tier).");
 }
+// The library store adds a revision number (so a stale device can't overwrite
+// a newer copy) and keeps previous versions. See library-store.js.
+const libraryStore = dbPool ? createLibraryStore(dbPool) : null;
 async function ensureLibrarySchema() {
-  if (!dbPool) return;
+  if (!libraryStore) return;
   try {
-    await dbPool.query(`
-      CREATE TABLE IF NOT EXISTS library (
-        email TEXT PRIMARY KEY,
-        folders JSONB NOT NULL DEFAULT '[]'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-      )
-    `);
-    console.log("[startup] library table ready");
+    await libraryStore.ensureSchema();
+    console.log("[startup] library tables ready");
   } catch (err) {
-    console.error("[startup] could not set up the library table — saved-folder sync is disabled until this is fixed:", err.message);
+    console.error("[startup] could not set up the library tables — saved-folder sync is disabled until this is fixed:", err.message);
   }
 }
 ensureLibrarySchema();
@@ -292,6 +292,29 @@ const SEARCH_CACHE_HOURS = (() => {
   return Number.isFinite(h) ? h : 12;
 })();
 const searchCache = createResponseCache({ ttlMs: SEARCH_CACHE_HOURS * 60 * 60 * 1000 });
+
+// The "Official data" card above the papers: a headline figure from the World
+// Bank's open data service, with its definition and a ready citation. The AI
+// only picks WHICH indicator to look up; the number always comes from the data
+// service itself (see official-data.js). OFFICIAL_DATA=off switches it off.
+const officialData = createOfficialData({
+  enabled: process.env.OFFICIAL_DATA !== "off",
+  fetchFn: (url, opts = {}) => fetch(url, { ...opts, signal: AbortSignal.timeout(12000) }),
+  askModel: async (prompt) => {
+    const msg = await createMessageWithRetry({
+      model: MODEL,
+      max_tokens: 160,
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }]
+    });
+    return msg.content.find(b => b.type === "text")?.text || "";
+  }
+});
+// The card is a bonus: it must never hold the papers back. Past this, the
+// search is returned without it (the lookup carries on and is ready next time).
+const OFFICIAL_DATA_DEADLINE_MS = 9000;
+const withDeadline = (promise, ms) =>
+  Promise.race([promise, new Promise(resolve => setTimeout(() => resolve(null), ms).unref?.())]);
 
 // ---------- Turn a natural-language question into a search-engine query ----------
 async function buildSearchQuery(question) {
@@ -1000,7 +1023,7 @@ Judge relevance by substance, not vocabulary. A paper that shares terminology wi
 For each highlight, give one short, plain sentence of context on why it matters — not a verdict on relevance, just context to help the reader judge it themselves.
 
 Also give the paper two scores (0-100), your own honest estimate — these are shown to the reader as informational context only, never used to hide or rank results, so give your genuine judgment rather than avoiding extremes:
-- "relevance": how relevant this paper is to the student's question overall
+- "relevance": how relevant this paper is to the student's question overall. Use the full range: 80-100 directly answers the question, 50-79 is about the right subject but a different angle, 20-49 shares topic words but studies a different condition, population or question, 0-19 is unrelated and only coincidentally shares a word such as "patients" or "number". Do not give an off-topic paper a middling score to be safe.
 - "accuracy": how much the highlighted excerpt(s) can be trusted at face value — factoring in (a) whether this is genuinely the right paper for the topic, not a loose or mismatched result, (b) whether the quoted excerpt(s) genuinely reflect the paper's actual finding rather than being taken out of context, and (c) whether they're faithfully represented rather than overstated or contradicted by the rest of the abstract
 
 Papers:
@@ -1030,8 +1053,8 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
   // Keep the original candidate order (OpenAlex/Semantic Scholar's own
   // relevance ranking) rather than however the model happened to list
   // them — the reader gets the raw search-engine ordering, not an
-  // AI re-ranking. Relevance/accuracy scores are informational only —
-  // they never filter, sort, or hide anything here.
+  // AI re-ranking. Nothing is filtered here; papers the model scored as
+  // clearly off-topic are removed afterwards by dropOffTopic.
   const clampScore = n => (typeof n === "number" && isFinite(n)) ? Math.max(0, Math.min(100, Math.round(n))) : null;
   const byIndex = new Map(parsed.map(s => [s.index, s]));
   return papers
@@ -1074,9 +1097,20 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
         ? Math.round((relevance + accuracy) / 2)
         : (relevance ?? accuracy ?? null);
 
-      return { ...paper, highlights, suitability };
+      return { ...paper, highlights, suitability, relevance };
     })
     .filter(Boolean);
+}
+
+// highlightPapers, minus the papers the AI judged off-topic (see dropOffTopic).
+// Used wherever papers are going to be shown to a student.
+async function highlightOnTopic(question, papers) {
+  const highlighted = await highlightPapers(question, papers);
+  const onTopic = dropOffTopic(highlighted);
+  if (onTopic.length < highlighted.length) {
+    console.log(`[search] dropped ${highlighted.length - onTopic.length} off-topic paper(s) for "${question.slice(0, 80)}"`);
+  }
+  return onTopic;
 }
 
 // =====================================================================
@@ -1209,40 +1243,50 @@ async function requireAuth(req, res, next) {
 }
 
 // ---------- Per-account rate limiting ----------
-// Discourages one paid account being shared across multiple people by
-// capping how many AI-costing requests a single account can make within a
-// rolling hour. Deliberately generous — a genuine single student, even on
-// a heavy assignment day, should never come close to this; it's aimed at
-// clear multi-person sharing, not normal use. Kept in memory rather than
-// a database for simplicity — it resets on a redeploy, an acceptable
-// trade-off for a first version, and this instance only runs one process
-// (WEB_CONCURRENCY=1), so there's no cross-process consistency issue yet.
-const usageLog = new Map(); // email -> array of request timestamps (ms)
-const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000; // 1 hour
-// Configurable via Render's environment variables without needing a code
-// change — RATE_LIMIT_MAX=20 by default. Lowered from an earlier, more
-// generous 40: a genuine single student, even on a busy one-assignment
-// day, rarely exceeds 20 actions in a single hour, while even a modest
-// two-person sharing scenario (10 each) comfortably trips this — three or
-// more sharing an account becomes very hard to avoid hitting it at all.
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "20", 10);
-
-function rateLimit(req, res, next) {
-  if (process.env.DISABLE_AUTH === "true") return next(); // stress-testing bypass, same as requireAuth
-  if (isAdminEmail(req.email)) return next(); // the account owner's own free access is exempt
-  const now = Date.now();
-  const timestamps = (usageLog.get(req.email) || []).filter(t => now - t < RATE_LIMIT_WINDOW_MS);
-  if (timestamps.length >= RATE_LIMIT_MAX) {
-    // Visible to you in Render's logs — the block itself already protects
-    // against sharing, but without this you'd have no way to actually see
-    // it happening or notice a pattern worth investigating.
-    console.warn(`[rate-limit] FLAGGED: ${req.email} hit ${timestamps.length} requests in the last hour (limit: ${RATE_LIMIT_MAX}) — possible account sharing.`);
-    return res.status(429).json({ error: "This account has made a lot of requests in the last hour. If this account is being shared, each person needs their own subscription — otherwise, just try again shortly." });
+// Discourages one paid account being shared across several people, and caps
+// cost, by limiting how much a single account can do in a rolling hour. Not
+// every action weighs the same: a search or a citation check costs a full
+// "search", a folder summary or adding a paper by DOI half of one, and a Vera
+// question or one paper's summary a quarter. RATE_LIMIT_MAX is the hour's
+// allowance in searches (default 20). A student working through a folder with
+// Vera no longer uses up the allowance meant for searching. The running totals
+// are copied to the database (usage_events) so a redeploy doesn't reset them.
+// See rate-limit.js.
+const RATE_LIMIT_MAX = parseLimit(process.env.RATE_LIMIT_MAX, 20);
+const usageStore = dbPool ? createUsageStore(dbPool) : null;
+const limiter = createRateLimiter({ max: RATE_LIMIT_MAX, store: usageStore });
+(async () => {
+  if (!usageStore) return;
+  const startedAt = Date.now();
+  try {
+    await usageStore.ensureSchema();
+    const restored = await limiter.hydrate(startedAt);
+    if (restored) console.log(`[startup] restored ${restored} usage records from the last hour, so the redeploy didn't reset anyone's allowance`);
+  } catch (err) {
+    console.error("[startup] could not load earlier usage, counting from memory only:", err.message);
   }
-  timestamps.push(now);
-  usageLog.set(req.email, timestamps);
-  next();
+})();
+setInterval(() => { limiter.sweep(); }, 60 * 60 * 1000).unref();
+
+function rateLimitFor(cost) {
+  return function rateLimit(req, res, next) {
+    if (process.env.DISABLE_AUTH === "true") return next(); // stress-testing bypass, same as requireAuth
+    if (isAdminEmail(req.email)) return next(); // the account owner's own free access is exempt
+    const r = limiter.check(req.email, cost);
+    if (!r.ok) {
+      // Visible to you in Render's logs: the block itself already protects
+      // against sharing, but without this you'd have no way to see it happening.
+      console.warn(`[rate-limit] FLAGGED: ${req.email} used ${r.used} of ${RATE_LIMIT_MAX} in the last hour, possible account sharing.`);
+      const minutes = Math.max(1, Math.ceil(r.retryAfterMs / 60000));
+      res.setHeader("Retry-After", String(Math.ceil(r.retryAfterMs / 1000)));
+      return res.status(429).json({ error: `This account has made a lot of requests in the last hour. If this account is being shared, each person needs their own subscription. Otherwise, you can carry on in about ${minutes} minute${minutes === 1 ? "" : "s"}.` });
+    }
+    next();
+  };
 }
+const limitFull = rateLimitFor(COSTS.full);   // searches, citation checks, Hit the Mark
+const limitHalf = rateLimitFor(COSTS.half);   // folder summaries, adding a paper by DOI, the search-query helper
+const limitLight = rateLimitFor(COSTS.light); // Vera questions, one paper's summary or explanation
 
 // ---------- Start a subscription ----------
 // ---------- Sign-up consent, and the renewal terms shown at checkout ----------
@@ -1725,15 +1769,22 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
 });
 
 // ---------- Saved folders (account-based, not browser-based) ----------
-// GET returns what the server has for this email; the frontend treats
-// this as the source of truth on login/page load and overwrites its local
-// cache with it. PUT replaces the whole folder list, same shape localStorage
-// used — simplest possible contract, no per-folder diffing to get wrong.
+// GET returns { folders, revision }. folders is null when the server has
+// nothing for this account yet (different from [], an empty library).
+//
+// PUT takes { folders, baseRevision }. baseRevision is the revision the
+// browser's copy was built on:
+//   - a number: saved only if the server is still on that revision. If
+//     another device saved in the meantime, the answer is 409 with the
+//     server's current { folders, revision } so the browser can merge the two
+//     (see library-merge.js) and try again. Nothing is overwritten.
+//   - null: "I think nothing is stored yet", same rule.
+//   - left out: an older copy of the app that predates revisions. Its copy
+//     simply replaces the stored one, as it always did.
 app.get("/api/library", requireAuth, async (req, res) => {
-  if (!dbPool) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
+  if (!libraryStore) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
   try {
-    const { rows } = await dbPool.query("SELECT folders FROM library WHERE email = $1", [req.email]);
-    res.json({ folders: rows[0]?.folders ?? null }); // null = "server has nothing yet", distinct from "[]" = "server has an empty library"
+    res.json(await libraryStore.load(req.email));
   } catch (err) {
     console.error("[library] load failed:", err.message);
     res.status(502).json({ error: "Could not load saved folders" });
@@ -1741,16 +1792,22 @@ app.get("/api/library", requireAuth, async (req, res) => {
 });
 
 app.put("/api/library", requireAuth, async (req, res) => {
-  if (!dbPool) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
+  if (!libraryStore) return res.status(503).json({ error: "Saved-folder sync isn't configured on the server yet." });
   const folders = req.body?.folders;
   if (!Array.isArray(folders)) return res.status(400).json({ error: "Body must be { folders: [...] }" });
+  let baseRevision; // left undefined for an older app copy
+  if (req.body && Object.prototype.hasOwnProperty.call(req.body, "baseRevision")) {
+    const b = req.body.baseRevision;
+    if (b === null) baseRevision = null;
+    else if (Number.isInteger(b) && b >= 0) baseRevision = b;
+    else return res.status(400).json({ error: "baseRevision must be a whole number or null" });
+  }
   try {
-    await dbPool.query(
-      `INSERT INTO library (email, folders, updated_at) VALUES ($1, $2, now())
-       ON CONFLICT (email) DO UPDATE SET folders = $2, updated_at = now()`,
-      [req.email, JSON.stringify(folders)]
-    );
-    res.json({ ok: true });
+    const out = await libraryStore.save(req.email, folders, baseRevision);
+    if (out.conflict) {
+      return res.status(409).json({ error: "Your folders changed on another device. Merging.", folders: out.folders, revision: out.revision });
+    }
+    res.json({ ok: true, revision: out.revision });
   } catch (err) {
     console.error("[library] save failed:", err.message);
     res.status(502).json({ error: "Could not save folders" });
@@ -1843,7 +1900,7 @@ async function runSearch(question, minYear, oaOpts) {
   // picking a highlight. Failures here just fall back to abstract-only
   // for that one paper; they never break the search.
   //
-  const highlighted = await highlightPapers(question, papers);
+  const highlighted = await highlightOnTopic(question, papers);
   console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
   // Highest suitability first (ties go to the paper more sources agreed on,
   // then the more cited). The 20 shown are the 20 most suitable, except that
@@ -1901,7 +1958,7 @@ async function runSearch(question, minYear, oaOpts) {
   return { value: { results: finalResults, searchQuery }, cacheable: quality === "ok" };
 }
 
-app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
+app.get("/api/search", requireAuth, limitFull, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
@@ -1913,17 +1970,24 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   const oaOpts = { requireOA: !includePaywalled };
 
   try {
+    // Started first so it runs alongside the paper search, not after it. It
+    // never rejects: no figure just means no card.
+    const officialPromise = withDeadline(officialData.find(question), OFFICIAL_DATA_DEADLINE_MS);
+
     // The same question from another student, now or within the last few hours,
     // gets the answer already worked out (see response-cache.js). Admins can add
     // ?fresh=1 to see what a search really returns right now.
     const { value, status } = await searchCache.run(
-      searchCacheKey("search", question, { minYear, includePaywalled }),
+      searchCacheKey("search-v2", question, { minYear, includePaywalled }),
       () => runSearch(question, minYear, oaOpts),
       { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
     if (status === "hit") console.log(`[search] "${question}" answered from the cache`);
     else if (status === "joined") console.log(`[search] "${question}" shared a search already running`);
-    res.json(value);
+
+    // Added to a copy: the cached search result stays exactly as it was.
+    const official = await officialPromise;
+    res.json(official ? { ...value, officialData: official } : value);
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Search failed", detail: err.message });
@@ -2001,7 +2065,7 @@ async function runCriticalSearch(question, minYear, oaOpts) {
     return { value: { supports: [], challenges: [], warning: "No open-access papers found for this query." }, cacheable: false };
   }
 
-  const highlighted = await highlightPapers(question, papers);
+  const highlighted = await highlightOnTopic(question, papers);
   const highlightedSupport = highlighted.filter(p => p.angle === "support").length;
   const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
   console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
@@ -2053,7 +2117,7 @@ async function runCriticalSearch(question, minYear, oaOpts) {
   return { value: { supports: finalSupports, challenges: finalChallenges, supportQuery, counterQuery }, cacheable: quality === "ok" };
 }
 
-app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
+app.get("/api/critical-search", requireAuth, limitFull, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
   const minYear = req.query.minYear ? parseInt(req.query.minYear, 10) : null;
@@ -2066,7 +2130,7 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
 
   try {
     const { value, status } = await searchCache.run(
-      searchCacheKey("critical", question, { minYear, includePaywalled }),
+      searchCacheKey("critical-v2", question, { minYear, includePaywalled }),
       () => runCriticalSearch(question, minYear, oaOpts),
       { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
@@ -2088,7 +2152,7 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
 // same highlighting Claude already does for every search result, against
 // the folder's own research question — so the student sees why (or
 // whether) it's actually relevant before it lands in their folder.
-app.post("/api/add-by-doi", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/add-by-doi", requireAuth, limitHalf, async (req, res) => {
   const doi = cleanDoi(req.body.doi);
   const question = (req.body.question || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing question" });
@@ -3014,7 +3078,7 @@ async function findUnaddressedCounterEvidence(essayText, researchQuestion) {
   const found = dedupe(requireTermMatch(raw, [counterQuery]));
   if (found.length === 0) return null; // nothing real to flag against
 
-  const highlighted = await highlightPapers(researchQuestion, interleaveBySource(found).slice(0, 15));
+  const highlighted = await highlightOnTopic(researchQuestion, interleaveBySource(found).slice(0, 15));
   const candidates = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1)).slice(0, 5);
   if (candidates.length === 0) return null;
 
@@ -3150,7 +3214,7 @@ function sanitizeFolderPapers(raw) {
   return cleaned.length ? cleaned : null;
 }
 
-app.post("/api/audit-essay", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/audit-essay", requireAuth, limitFull, async (req, res) => {
   const essayText = (req.body.essay || "").toString().trim();
   if (!essayText) return res.status(400).json({ error: "Missing essay text" });
   if (essayText.length > 100000) return res.status(400).json({ error: "Essay too long — 100,000 characters max (around 15,000 words)" });
@@ -3209,7 +3273,7 @@ async function extractTextFromFile(file) {
 
 // ---------- Citation Audit: file upload (.docx / .pdf / .txt) ----------
 // Accepts a Word doc or plain text file instead of pasted text.
-app.post("/api/audit-essay/upload", requireAuth, rateLimit, upload.single("file"), async (req, res) => {
+app.post("/api/audit-essay/upload", requireAuth, limitFull, upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
   let essayText;
@@ -3289,7 +3353,7 @@ async function runLiteratureSearch(question, { requireOA = true, limit = 20 } = 
   const importance = landmarkStats(allFound);
   const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
   if (papers.length === 0) return { results: [], searchQuery };
-  const highlighted = await highlightPapers(question, papers);
+  const highlighted = await highlightOnTopic(question, papers);
   // One of a handful of places is held for an important paper, if there is
   // one the AI judged relevant; with a smaller limit, none is.
   const results = selectFinal(highlighted, { cap: limit, reserve: limit >= 5 ? 1 : 0, minSuitability: 50, stats: importance });
@@ -3360,7 +3424,7 @@ Respond with ONLY a JSON array, nothing else, in this exact shape:
   })).slice(0, 20);
 }
 
-app.post("/api/hit-the-mark", requireAuth, rateLimit, upload.fields([{ name: "criteriaFile", maxCount: 1 }, { name: "essayFile", maxCount: 1 }]), async (req, res) => {
+app.post("/api/hit-the-mark", requireAuth, limitFull, upload.fields([{ name: "criteriaFile", maxCount: 1 }, { name: "essayFile", maxCount: 1 }]), async (req, res) => {
   let criteriaText, essayText;
   try {
     const criteriaFile = req.files?.criteriaFile?.[0];
@@ -3542,7 +3606,7 @@ Abstract: ${abstract}
 Explain in plain, everyday English what this paper actually found or argues — as if to someone with no background in this field. Avoid jargon entirely where you can; where a technical term genuinely can't be avoided, briefly say what it means in plain words right there. In your own words, never quoting the abstract directly. 2-4 sentences.`;
 }
 
-app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/summarize-source", requireAuth, limitLight, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const title = (req.body.title || "").toString().trim();
   const abstract = (req.body.abstract || "").toString().trim();
@@ -3565,7 +3629,7 @@ app.post("/api/summarize-source", requireAuth, rateLimit, async (req, res) => {
   }
 });
 
-app.post("/api/explain-source", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/explain-source", requireAuth, limitLight, async (req, res) => {
   const title = (req.body.title || "").toString().trim();
   const abstract = (req.body.abstract || "").toString().trim();
   if (!abstract) return res.status(400).json({ error: "Missing abstract" });
@@ -3592,7 +3656,7 @@ app.post("/api/explain-source", requireAuth, rateLimit, async (req, res) => {
 // across all the saved abstracts at once (agreement, disagreement,
 // overall picture), in its own words, rather than describing each paper
 // one by one.
-app.post("/api/summarize-folder", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/summarize-folder", requireAuth, limitHalf, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   const papers = Array.isArray(req.body.papers) ? req.body.papers.slice(0, 20) : [];
   const withAbstracts = papers.filter(p => p && (p.abstract || "").toString().trim());
@@ -3653,12 +3717,24 @@ async function answerCompanionQuestion(question, folders, { history = [], omitte
   });
 }
 
-app.post("/api/ask", requireAuth, rateLimit, async (req, res) => {
+app.post("/api/ask", requireAuth, limitLight, async (req, res) => {
   const question = (req.body.question || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing question" });
   if (question.length > 2000) return res.status(400).json({ error: "That question's a bit long — keep it under 2,000 characters." });
 
-  const { folders, omittedPapers } = sanitizeFoldersForAsk(req.body.folders);
+  // The app only sends the folders along when its copy has changes the account
+  // hasn't received yet (or sync isn't set up). Otherwise Vera reads them from
+  // the student's account here, which keeps each question small and fast.
+  let rawFolders = req.body.folders;
+  if (!Array.isArray(rawFolders) && libraryStore) {
+    try {
+      rawFolders = (await libraryStore.load(req.email)).folders;
+    } catch (err) {
+      console.error("[ask] could not load the saved folders:", err.message);
+      rawFolders = null;
+    }
+  }
+  const { folders, omittedPapers } = sanitizeFoldersForAsk(rawFolders);
   const history = sanitizeAskHistory(req.body.history);
 
   try {
@@ -3783,7 +3859,7 @@ app.post("/api/ask-public", publicAskRateLimit, async (req, res) => {
   }
 });
 
-app.get("/api/lexicon", requireAuth, rateLimit, async (req, res) => {
+app.get("/api/lexicon", requireAuth, limitHalf, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
 
@@ -3800,4 +3876,9 @@ app.get("/api/lexicon", requireAuth, rateLimit, async (req, res) => {
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3787;
-app.listen(port, () => console.log(`LitMark backend running on :${port}`));
+app.listen(port, () => {
+  console.log(`LitMark backend running on :${port}`);
+  // Load the World Bank indicator list now so the first student's search doesn't
+  // wait for it. Failure is fine: it is retried on the first search that needs it.
+  officialData.warm();
+});

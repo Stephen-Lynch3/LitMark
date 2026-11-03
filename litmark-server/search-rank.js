@@ -269,3 +269,16 @@ export function selectFinal(highlighted, { cap = 20, reserve = 3, minSuitability
   }
   return kept.sort(compareForDisplay);
 }
+
+// A paper the AI scored below this for relevance is not shown, however high its
+// other score is. Suitability averages relevance and accuracy, and "accuracy"
+// only asks whether the quoted sentence is faithful, so a paper on a different
+// subject quoted honestly could still average out mid-table (a breastfeeding
+// study turning up for "number of cancer patients in the UK"). Relevance
+// alone decides whether a paper belongs.
+export const MIN_RELEVANCE = 40;
+
+// A paper with no relevance score (the AI gave none) is kept: it can't be judged.
+export function dropOffTopic(papers, min = MIN_RELEVANCE) {
+  return papers.filter(p => typeof p.relevance !== "number" || p.relevance >= min);
+}

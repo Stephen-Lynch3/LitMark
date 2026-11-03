@@ -236,3 +236,27 @@ test("rescued papers never push out another important paper, and the reserve is 
   assert.ok(out.some(p => p.title === "Landmark 30"));
   assert.equal(out.filter(p => /^Landmark/.test(p.title)).length, 3);
 });
+
+// ---------- off-topic papers ----------
+
+test("off-topic: a paper scored below the relevance floor is dropped even when its average is mid-table", async () => {
+  const { dropOffTopic, MIN_RELEVANCE } = await import("./search-rank.js");
+  // relevance 20 + accuracy 80 averages to a Suitability of exactly 50
+  const breastfeeding = { id: "a", relevance: 20, suitability: 50 };
+  const onTopic = { id: "b", relevance: 70, suitability: 75 };
+  assert.deepEqual(dropOffTopic([breastfeeding, onTopic]).map(p => p.id), ["b"]);
+  assert.ok(MIN_RELEVANCE > 20);
+});
+
+test("off-topic: the floor is inclusive, and a paper with no relevance score is kept", async () => {
+  const { dropOffTopic, MIN_RELEVANCE } = await import("./search-rank.js");
+  const atFloor = { id: "a", relevance: MIN_RELEVANCE };
+  const justBelow = { id: "b", relevance: MIN_RELEVANCE - 1 };
+  const unscored = { id: "c", relevance: null };
+  assert.deepEqual(dropOffTopic([atFloor, justBelow, unscored]).map(p => p.id), ["a", "c"]);
+});
+
+test("off-topic: if every paper is off-topic the result is empty, not padded with weak matches", async () => {
+  const { dropOffTopic } = await import("./search-rank.js");
+  assert.deepEqual(dropOffTopic([{ relevance: 5 }, { relevance: 30 }]), []);
+});

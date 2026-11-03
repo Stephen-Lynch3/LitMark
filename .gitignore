@@ -1,2 +1,5 @@
 litmark-server/.env
 litmark-server/node_modules
+
+# Backups of students' saved folders (scripts/library-tool.js backup). Never commit these.
+litmark-server/backups/
