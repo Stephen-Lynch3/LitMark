@@ -38,6 +38,8 @@ import {
   buildVeraSystemPrompt, buildVeraUserContent, parseModelJson, finaliseVeraAnswer
 } from "./vera-context.js";
 import { dedupePapers, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
+import { createResponseCache, searchCacheKey } from "./response-cache.js";
+import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -211,6 +213,84 @@ function emailFailureHint(message) {
     ? " -> Resend won't send from this address yet. Verify litmark.org at resend.com/domains and set FROM_EMAIL on Render to an address on it, e.g. \"LitMark <hello@litmark.org>\"."
     : "";
 }
+
+// ---------- Watching the literature sources, and remembering finished searches ----------
+// Every source swallows its own errors so one outage can't break a search, which
+// also means a dead source used to be invisible. source-health.js counts how
+// many searches in a row each important source has returned nothing for, and
+// emails the owner when one has been quiet for SOURCE_ALERT_AFTER searches
+// (default 5). ALERT_EMAIL (comma-separated) says who; it falls back to
+// ADMIN_EMAILS. SOURCE_ALERT_WATCH changes which sources are watched (default:
+// OpenAlex, plus Semantic Scholar if it has an API key, plus "All sources").
+const ALERT_RECIPIENTS = (process.env.ALERT_EMAIL || process.env.ADMIN_EMAILS || "")
+  .split(",").map(e => e.trim()).filter(Boolean);
+
+const SOURCE_HELP = {
+  "OpenAlex": "OpenAlex works on a daily credit allowance. Check that OPENALEX_API_KEY is set on Render and look at your usage at openalex.org/settings/api. This is what ran out last time.",
+  "Semantic Scholar": "Semantic Scholar rate-limits anonymous requests heavily. A free SEMANTIC_SCHOLAR_API_KEY on Render fixes most cases (semanticscholar.org/product/api).",
+  "Crossref": "Crossref is normally very reliable. Check status.crossref.org, and that CONTACT_EMAIL on Render is a real address. (It only returns papers when a search includes paywalled ones.)",
+  "All sources": "Nothing came back from any source. Most likely the server has lost its network connection or is being blocked. Check Render's logs and the service status."
+};
+
+async function sendSourceAlertEmail(events) {
+  const quiet = events.filter(e => e.type === "quiet");
+  const back = events.filter(e => e.type === "recovered");
+  if (!ALERT_RECIPIENTS.length) {
+    console.error("[source-health] No ALERT_EMAIL or ADMIN_EMAILS is set, so this alert was only written to the logs.");
+    return;
+  }
+  const subject = quiet.length
+    ? `LitMark: ${quiet.map(e => e.source).join(" and ")} ${quiet.length === 1 && quiet[0].source !== "All sources" ? "has" : "have"} stopped returning results`
+    : `LitMark: ${back.map(e => e.source).join(" and ")} ${back.length === 1 ? "is" : "are"} answering again`;
+
+  const lines = [];
+  for (const e of quiet) {
+    lines.push(`${e.source} has returned nothing for the last ${e.streak} searches, while other sources were answering.`);
+    if (e.lastError) lines.push(`Last error it reported: ${e.lastError}`);
+    if (SOURCE_HELP[e.source]) lines.push(SOURCE_HELP[e.source]);
+    lines.push("");
+  }
+  for (const e of back) lines.push(`${e.source} is returning results again.`, "");
+  lines.push("Searches keep working while a source is down, but with fewer papers to choose from. While a source is failing, search answers are not kept for reuse, so nothing stale is being served.");
+  lines.push("You will get one email per outage, a reminder every 12 hours while it lasts, and one when it recovers.");
+
+  const text = lines.join("\n");
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"></head><body style="margin:0;padding:16px;"><div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;color:#14161A;line-height:1.55;font-size:15px;">${
+    lines.map(l => (l ? `<p style="margin:0 0 12px;">${esc(l)}</p>` : "")).join("")
+  }</div></body></html>`;
+
+  try {
+    await sendEmail({ to: ALERT_RECIPIENTS, subject, html, text });
+  } catch (err) {
+    console.error("[source-health] alert email failed to send:", err.message + emailFailureHint(err.message));
+  }
+}
+
+const sourceHealth = createSourceHealth({
+  watch: parseWatchList(
+    process.env.SOURCE_ALERT_WATCH,
+    process.env.SEMANTIC_SCHOLAR_API_KEY ? ["OpenAlex", "Semantic Scholar", "All sources"] : ["OpenAlex", "All sources"]
+  ),
+  threshold: Math.max(1, parseInt(process.env.SOURCE_ALERT_AFTER || "5", 10) || 5),
+  notify: sendSourceAlertEmail
+});
+
+// Every source's catch block reports here: the same line in the logs as before,
+// plus the reason is kept so an alert can say why.
+function reportSourceFailure(source, err) {
+  console.error(`${source} failed:`, err?.message || err);
+  sourceHealth.noteError(source, err?.message || err);
+}
+
+// The answer to a search doesn't depend on who asked, and a class set the same
+// question will all search for it, so finished answers are reused. See
+// response-cache.js. SEARCH_CACHE_HOURS=0 switches this off.
+const SEARCH_CACHE_HOURS = (() => {
+  const h = parseFloat(process.env.SEARCH_CACHE_HOURS);
+  return Number.isFinite(h) ? h : 12;
+})();
+const searchCache = createResponseCache({ ttlMs: SEARCH_CACHE_HOURS * 60 * 60 * 1000 });
 
 // ---------- Turn a natural-language question into a search-engine query ----------
 async function buildSearchQuery(question) {
@@ -410,7 +490,7 @@ async function searchOpenAlex(query, { requireOA = true } = {}) {
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`OpenAlex failed:`, err?.message || err);
+    reportSourceFailure("OpenAlex", err);
     return [];
   }
 }
@@ -460,7 +540,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       abstract: p.abstract
     }));
   } catch (err) {
-    console.error(`Semantic Scholar failed:`, err?.message || err);
+    reportSourceFailure("Semantic Scholar", err);
     return [];
   }
 }
@@ -526,7 +606,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`Europe PMC failed:`, err?.message || err);
+    reportSourceFailure("Europe PMC", err);
     return [];
   }
 }
@@ -583,7 +663,7 @@ async function searchCORE(query, { requireOA = true } = {}) {
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`CORE failed:`, err?.message || err);
+    reportSourceFailure("CORE", err);
     return [];
   }
 }
@@ -634,7 +714,7 @@ async function searchDOAJ(query, { requireOA = true } = {}) {
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`DOAJ failed:`, err?.message || err);
+    reportSourceFailure("DOAJ", err);
     return [];
   }
 }
@@ -699,7 +779,7 @@ async function searchCrossref(query, { requireOA = true } = {}) {
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`Crossref failed:`, err?.message || err);
+    reportSourceFailure("Crossref", err);
     return [];
   }
 }
@@ -753,7 +833,7 @@ async function searchERIC(query, { requireOA = true } = {}) {
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
-    console.error(`ERIC failed:`, err?.message || err);
+    reportSourceFailure("ERIC", err);
     return [];
   }
 }
@@ -1677,6 +1757,149 @@ app.put("/api/library", requireAuth, async (req, res) => {
 });
 
 // ---------- Search (subscribers only) ----------
+// One full search: seven sources, rank fusion, the AI step, full-text enrichment.
+// Returns { value, cacheable }: what to send back, and whether it is healthy
+// enough to reuse for the next student who asks the same question.
+const SEARCH_SOURCE_LABELS = repeatSourceLabels(2); // the seven sources, once on the raw question and once on the distilled query
+async function runSearch(question, minYear, oaOpts) {
+  // The 7 sources searched on the RAW question don't depend on the
+  // distilled query at all, so they're fired off immediately here rather
+  // than after awaiting buildSearchQuery below — that removes one whole
+  // sequential Claude round-trip (the distillation call) from the front
+  // of the critical path. Calling an async function starts it running
+  // right away; it's only the `await` that would have blocked.
+  const rawFetchPromises = [
+    searchOpenAlex(question, oaOpts),
+    searchSemanticScholar(question, oaOpts),
+    searchEuropePMC(question, oaOpts),
+    searchCORE(question, oaOpts),
+    searchDOAJ(question, oaOpts),
+    searchCrossref(question, oaOpts),
+    searchERIC(question, oaOpts)
+  ];
+
+  const searchQuery = await buildSearchQuery(question);
+
+  // Two nets, not one: the distilled keyword query catches precise
+  // matches, but a narrowed query can miss papers a broader phrasing
+  // would find — especially for open, exploratory questions ("uses of
+  // X") rather than a specific claim. Searching the raw question too
+  // and merging both pools substantially widens coverage.
+  const queryFetchPromises = [
+    searchOpenAlex(searchQuery, oaOpts),
+    searchSemanticScholar(searchQuery, oaOpts),
+    searchEuropePMC(searchQuery, oaOpts),
+    searchCORE(searchQuery, oaOpts),
+    searchDOAJ(searchQuery, oaOpts),
+    searchCrossref(searchQuery, oaOpts),
+    searchERIC(searchQuery, oaOpts)
+  ];
+
+  const fetches = await Promise.allSettled([...rawFetchPromises, ...queryFetchPromises]);
+  const labels = ["OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(raw)", "CORE(raw)", "DOAJ(raw)", "Crossref(raw)", "ERIC(raw)", "OpenAlex(query)", "SemanticScholar(query)", "EuropePMC(query)", "CORE(query)", "DOAJ(query)", "Crossref(query)", "ERIC(query)"];
+  fetches.forEach((f, i) => {
+    if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
+    else console.log(`${labels[i]}: ${f.value.length} results`);
+  });
+
+  // How many papers each source gave, over both rounds. Feeds the alert for a
+  // source that has gone quiet, and decides whether this answer is healthy
+  // enough to be kept for the next student who asks the same question.
+  const counts = tallySources(fetches, SEARCH_SOURCE_LABELS);
+  sourceHealth.record(counts);
+  const quality = runQuality(counts);
+  if (quality !== "ok") console.warn("[search] sources were thin for this search, so its answer will not be kept for reuse:", counts);
+
+  // A paper with no year on record is kept rather than penalized —
+  // only papers we KNOW are older than the cutoff are excluded.
+  const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
+  // Each of the 14 lists keeps the order its own source ranked it in. Rank
+  // fusion (search-rank.js) combines them: papers several lists found, and
+  // found high up, come first. Then 36 go to the AI step, with room held for
+  // each source's best and for a few important papers (see selectCandidates).
+  const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(dateFilter(f.value), [searchQuery, question]) : []);
+  const allFound = fuseRankedLists(lists);
+  const importance = landmarkStats(allFound);
+  const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
+
+  // Breaks candidate counts down by source at each stage — this is what
+  // actually shows whether a source is quietly contributing nothing,
+  // rather than just a single combined total that hides which source
+  // dropped out.
+  const bySource = (list) => list.reduce((acc, p) => { acc[p.source] = (acc[p.source] || 0) + 1; return acc; }, {});
+  console.log(`[search] candidates by source (before filter):`, bySource(allFound));
+  console.log(`[search] candidates by source (after filter):`, bySource(papers));
+
+  console.log(`[search] "${question}" -> query "${searchQuery}" -> ${allFound.length} candidates, ${papers.length} after keyword-match filter`);
+
+  if (papers.length === 0) {
+    return { value: { results: [], warning: "No open-access papers found for this query." }, cacheable: false };
+  }
+
+  // For every candidate — regardless of which source found it — check
+  // whether Europe PMC separately has full text available. This is what
+  // lets Claude consider Methods/Results, not just the abstract, when
+  // picking a highlight. Failures here just fall back to abstract-only
+  // for that one paper; they never break the search.
+  //
+  const highlighted = await highlightPapers(question, papers);
+  console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
+  // Highest suitability first (ties go to the paper more sources agreed on,
+  // then the more cited). The 20 shown are the 20 most suitable, except that
+  // up to 3 important papers that would have just missed the cut take the
+  // last places, as long as the AI judged them genuinely relevant — so a
+  // landmark paper or key review isn't lost for scoring a few points lower
+  // than twenty narrower ones.
+  const results = selectFinal(highlighted, { cap: 20, reserve: 3, minSuitability: 50, stats: importance });
+
+  // Full-text availability is checked only on the papers actually being
+  // shown, not the full candidate pool — checking all 36 candidates
+  // before highlighting used to mean checking ~16 papers that never even
+  // made it to the screen. Checking after slicing, on just these ~20,
+  // is meaningfully cheaper.
+  const withFullText = await mapWithConcurrency(results, 4, async (p) => {
+    try {
+      const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
+      if (!pmcid) return p;
+      return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
+    } catch {
+      return p;
+    }
+  });
+  console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} shown results`);
+
+  // For the (typically much smaller) subset that has full text, fetch
+  // the actual Methods/Results excerpts and re-run highlighting just for
+  // those — cheap now, since it only touches papers that already made
+  // the final cut, not the full 36-candidate pool this used to run on
+  // before full text was moved after slicing. Gives Claude a real shot
+  // at a more specific highlight than the abstract alone offers. If this
+  // step fails for any reason, or a paper's re-highlight comes back
+  // empty, the paper keeps its existing abstract-only highlight rather
+  // than being dropped — this only ever adds depth, never removes it.
+  const withExcerpts = await mapWithConcurrency(withFullText, 4, async (p) => {
+    if (!p.hasFullText) return p;
+    try {
+      const excerpts = await fetchPmcFullText(p.pmcid);
+      if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
+      return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
+    } catch {
+      return p;
+    }
+  });
+
+  const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
+  let finalResults = withExcerpts;
+  if (toReHighlight.length > 0) {
+    const reHighlighted = await highlightPapers(question, toReHighlight);
+    const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
+    finalResults = withExcerpts.map(p => byIdRe.get(p.id) || p);
+    console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates -> ${reHighlighted.length} improved`);
+  }
+
+  return { value: { results: finalResults, searchQuery }, cacheable: quality === "ok" };
+}
+
 app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
@@ -1685,137 +1908,21 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
   // free to read are included too (abstract-only, linked to the publisher
   // page) — much of the literature in fields outside biomedicine sits
   // behind paywalls that a student's university library unlocks.
-  const oaOpts = { requireOA: req.query.includePaywalled !== "1" };
+  const includePaywalled = req.query.includePaywalled === "1";
+  const oaOpts = { requireOA: !includePaywalled };
 
   try {
-    // The 7 sources searched on the RAW question don't depend on the
-    // distilled query at all, so they're fired off immediately here rather
-    // than after awaiting buildSearchQuery below — that removes one whole
-    // sequential Claude round-trip (the distillation call) from the front
-    // of the critical path. Calling an async function starts it running
-    // right away; it's only the `await` that would have blocked.
-    const rawFetchPromises = [
-      searchOpenAlex(question, oaOpts),
-      searchSemanticScholar(question, oaOpts),
-      searchEuropePMC(question, oaOpts),
-      searchCORE(question, oaOpts),
-      searchDOAJ(question, oaOpts),
-      searchCrossref(question, oaOpts),
-      searchERIC(question, oaOpts)
-    ];
-
-    const searchQuery = await buildSearchQuery(question);
-
-    // Two nets, not one: the distilled keyword query catches precise
-    // matches, but a narrowed query can miss papers a broader phrasing
-    // would find — especially for open, exploratory questions ("uses of
-    // X") rather than a specific claim. Searching the raw question too
-    // and merging both pools substantially widens coverage.
-    const queryFetchPromises = [
-      searchOpenAlex(searchQuery, oaOpts),
-      searchSemanticScholar(searchQuery, oaOpts),
-      searchEuropePMC(searchQuery, oaOpts),
-      searchCORE(searchQuery, oaOpts),
-      searchDOAJ(searchQuery, oaOpts),
-      searchCrossref(searchQuery, oaOpts),
-      searchERIC(searchQuery, oaOpts)
-    ];
-
-    const fetches = await Promise.allSettled([...rawFetchPromises, ...queryFetchPromises]);
-    const labels = ["OpenAlex(raw)", "SemanticScholar(raw)", "EuropePMC(raw)", "CORE(raw)", "DOAJ(raw)", "Crossref(raw)", "ERIC(raw)", "OpenAlex(query)", "SemanticScholar(query)", "EuropePMC(query)", "CORE(query)", "DOAJ(query)", "Crossref(query)", "ERIC(query)"];
-    fetches.forEach((f, i) => {
-      if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
-      else console.log(`${labels[i]}: ${f.value.length} results`);
-    });
-
-    // A paper with no year on record is kept rather than penalized —
-    // only papers we KNOW are older than the cutoff are excluded.
-    const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
-    // Each of the 14 lists keeps the order its own source ranked it in. Rank
-    // fusion (search-rank.js) combines them: papers several lists found, and
-    // found high up, come first. Then 36 go to the AI step, with room held for
-    // each source's best and for a few important papers (see selectCandidates).
-    const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(dateFilter(f.value), [searchQuery, question]) : []);
-    const allFound = fuseRankedLists(lists);
-    const importance = landmarkStats(allFound);
-    const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
-
-    // Breaks candidate counts down by source at each stage — this is what
-    // actually shows whether a source is quietly contributing nothing,
-    // rather than just a single combined total that hides which source
-    // dropped out.
-    const bySource = (list) => list.reduce((acc, p) => { acc[p.source] = (acc[p.source] || 0) + 1; return acc; }, {});
-    console.log(`[search] candidates by source (before filter):`, bySource(allFound));
-    console.log(`[search] candidates by source (after filter):`, bySource(papers));
-
-    console.log(`[search] "${question}" -> query "${searchQuery}" -> ${allFound.length} candidates, ${papers.length} after keyword-match filter`);
-
-    if (papers.length === 0) {
-      return res.json({ results: [], warning: "No open-access papers found for this query." });
-    }
-
-    // For every candidate — regardless of which source found it — check
-    // whether Europe PMC separately has full text available. This is what
-    // lets Claude consider Methods/Results, not just the abstract, when
-    // picking a highlight. Failures here just fall back to abstract-only
-    // for that one paper; they never break the search.
-    //
-    const highlighted = await highlightPapers(question, papers);
-    console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
-    // Highest suitability first (ties go to the paper more sources agreed on,
-    // then the more cited). The 20 shown are the 20 most suitable, except that
-    // up to 3 important papers that would have just missed the cut take the
-    // last places, as long as the AI judged them genuinely relevant — so a
-    // landmark paper or key review isn't lost for scoring a few points lower
-    // than twenty narrower ones.
-    const results = selectFinal(highlighted, { cap: 20, reserve: 3, minSuitability: 50, stats: importance });
-
-    // Full-text availability is checked only on the papers actually being
-    // shown, not the full candidate pool — checking all 36 candidates
-    // before highlighting used to mean checking ~16 papers that never even
-    // made it to the screen. Checking after slicing, on just these ~20,
-    // is meaningfully cheaper.
-    const withFullText = await mapWithConcurrency(results, 4, async (p) => {
-      try {
-        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
-        if (!pmcid) return p;
-        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
-      } catch {
-        return p;
-      }
-    });
-    console.log(`[search] full text available for ${withFullText.filter(p => p.hasFullText).length}/${withFullText.length} shown results`);
-
-    // For the (typically much smaller) subset that has full text, fetch
-    // the actual Methods/Results excerpts and re-run highlighting just for
-    // those — cheap now, since it only touches papers that already made
-    // the final cut, not the full 36-candidate pool this used to run on
-    // before full text was moved after slicing. Gives Claude a real shot
-    // at a more specific highlight than the abstract alone offers. If this
-    // step fails for any reason, or a paper's re-highlight comes back
-    // empty, the paper keeps its existing abstract-only highlight rather
-    // than being dropped — this only ever adds depth, never removes it.
-    const withExcerpts = await mapWithConcurrency(withFullText, 4, async (p) => {
-      if (!p.hasFullText) return p;
-      try {
-        const excerpts = await fetchPmcFullText(p.pmcid);
-        if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
-        return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
-      } catch {
-        return p;
-      }
-    });
-
-    const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
-    let finalResults = withExcerpts;
-    if (toReHighlight.length > 0) {
-      const reHighlighted = await highlightPapers(question, toReHighlight);
-      const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
-      finalResults = withExcerpts.map(p => byIdRe.get(p.id) || p);
-      console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates -> ${reHighlighted.length} improved`);
-    }
-
-    res.json({ results: finalResults, searchQuery });
+    // The same question from another student, now or within the last few hours,
+    // gets the answer already worked out (see response-cache.js). Admins can add
+    // ?fresh=1 to see what a search really returns right now.
+    const { value, status } = await searchCache.run(
+      searchCacheKey("search", question, { minYear, includePaywalled }),
+      () => runSearch(question, minYear, oaOpts),
+      { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
+    );
+    if (status === "hit") console.log(`[search] "${question}" answered from the cache`);
+    else if (status === "joined") console.log(`[search] "${question}" shared a search already running`);
+    res.json(value);
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Search failed", detail: err.message });
@@ -1828,6 +1935,123 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
 // OWN search found it in. No post-hoc "does this support or challenge"
 // judgment call on Claude's part, so there's no failure mode where
 // everything gets classified as ambiguous and both columns end up empty.
+// One full critical-analysis search; same contract as runSearch.
+async function runCriticalSearch(question, minYear, oaOpts) {
+  const [supportQuery, counterQuery] = await Promise.all([
+    buildSearchQuery(question),
+    buildCounterQuery(question)
+  ]);
+
+  const [supportFetches, counterFetches] = await Promise.all([
+    Promise.allSettled([searchOpenAlex(supportQuery, oaOpts), searchSemanticScholar(supportQuery, oaOpts), searchEuropePMC(supportQuery, oaOpts), searchCORE(supportQuery, oaOpts), searchDOAJ(supportQuery, oaOpts), searchCrossref(supportQuery, oaOpts), searchERIC(supportQuery, oaOpts)]),
+    Promise.allSettled([searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts), searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts), searchDOAJ(counterQuery, oaOpts), searchCrossref(counterQuery, oaOpts), searchERIC(counterQuery, oaOpts)])
+  ]);
+  const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "DOAJ(support)", "Crossref(support)", "ERIC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)", "DOAJ(counter)", "Crossref(counter)", "ERIC(counter)"];
+  [...supportFetches, ...counterFetches].forEach((f, i) => {
+    if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
+  });
+
+  // Same bookkeeping as /api/search: per-source counts over both angles.
+  const counts = tallySources([...supportFetches, ...counterFetches], SEARCH_SOURCE_LABELS);
+  sourceHealth.record(counts);
+  const quality = runQuality(counts);
+  if (quality !== "ok") console.warn("[critical] sources were thin for this search, so its answer will not be kept for reuse:", counts);
+
+  const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
+
+  // One list per source, each in the order that source ranked it, tagged
+  // with the angle of the search that found it.
+  const angleLists = (fetches, query, angle) => fetches.map(f =>
+    f.status === "fulfilled"
+      ? requireTermMatch(dateFilter(f.value), [query]).map(p => ({ ...p, angle }))
+      : []
+  );
+  const supportLists = angleLists(supportFetches, supportQuery, "support");
+  const counterLists = angleLists(counterFetches, counterQuery, "challenge");
+  const supportRaw = supportLists.reduce((n, l) => n + l.length, 0);
+  const counterRaw = counterLists.reduce((n, l) => n + l.length, 0);
+  // Fuse WITHIN each angle separately (the same paper turning up from
+  // multiple sources for one query), not ACROSS the two angles. This used
+  // to run on both lists merged together with support listed first, so
+  // any paper found by BOTH searches — common whenever the two queries
+  // share vocabulary, which happens a lot on broad or vague questions —
+  // was unconditionally kept as "support" and erased from "challenge".
+  // That silently starved the challenge side before it even reached the
+  // per-angle cap below, which is why a fix there alone (capping support
+  // and challenge separately) wasn't enough on its own. A paper genuinely
+  // relevant to both searches can now appear in both columns rather than
+  // being forced into one; that's a fair trade against hiding real
+  // challenging evidence entirely.
+  const dedupedSupport = fuseRankedLists(supportLists);
+  const dedupedChallenge = fuseRankedLists(counterLists);
+  const supportImportance = landmarkStats(dedupedSupport);
+  const challengeImportance = landmarkStats(dedupedChallenge);
+  // Sized with margin above the 10 actually shown per side (below) —
+  // highlightPapers drops some candidates as not genuinely relevant, so
+  // sending exactly 10 in would often yield fewer than 10 out.
+  const papers = [
+    ...selectCandidates(dedupedSupport, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: supportImportance }),
+    ...selectCandidates(dedupedChallenge, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: challengeImportance })
+  ];
+
+  console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportRaw} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterRaw} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
+
+  if (papers.length === 0) {
+    return { value: { supports: [], challenges: [], warning: "No open-access papers found for this query." }, cacheable: false };
+  }
+
+  const highlighted = await highlightPapers(question, papers);
+  const highlightedSupport = highlighted.filter(p => p.angle === "support").length;
+  const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
+  console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
+  const supports = selectFinal(highlighted.filter(p => p.angle === "support"), { cap: 10, reserve: 2, minSuitability: 50, stats: supportImportance });
+  const challenges = selectFinal(highlighted.filter(p => p.angle === "challenge"), { cap: 10, reserve: 2, minSuitability: 50, stats: challengeImportance });
+
+  // Same principle as /api/search: full-text availability is only
+  // checked on the papers actually being shown (up to 20 here, not the
+  // full candidate pool).
+  const checkFullText = async (list) => mapWithConcurrency(list, 4, async (p) => {
+    try {
+      const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
+      if (!pmcid) return p;
+      return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
+    } catch {
+      return p;
+    }
+  });
+  const [supportsWithFullText, challengesWithFullText] = await Promise.all([
+    checkFullText(supports), checkFullText(challenges)
+  ]);
+
+  // Same re-highlighting step as /api/search: fetch real Methods/Results
+  // excerpts for the (typically small) subset with full text available,
+  // and give Claude a chance to find a more specific quote than the
+  // abstract alone. A paper keeps its existing highlight if this step
+  // fails or comes back empty for it — this only ever adds depth.
+  const combined = [...supportsWithFullText, ...challengesWithFullText];
+  const withExcerpts = await mapWithConcurrency(combined, 4, async (p) => {
+    if (!p.hasFullText) return p;
+    try {
+      const excerpts = await fetchPmcFullText(p.pmcid);
+      if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
+      return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
+    } catch {
+      return p;
+    }
+  });
+  const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
+  let finalCombined = withExcerpts;
+  if (toReHighlight.length > 0) {
+    const reHighlighted = await highlightPapers(question, toReHighlight);
+    const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
+    finalCombined = withExcerpts.map(p => byIdRe.get(p.id) || p);
+  }
+  const finalSupports = finalCombined.filter(p => p.angle === "support");
+  const finalChallenges = finalCombined.filter(p => p.angle === "challenge");
+
+  return { value: { supports: finalSupports, challenges: finalChallenges, supportQuery, counterQuery }, cacheable: quality === "ok" };
+}
+
 app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
   const question = (req.query.q || "").toString().trim();
   if (!question) return res.status(400).json({ error: "Missing query param: q" });
@@ -1836,116 +2060,18 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
   // free to read are included too (abstract-only, linked to the publisher
   // page) — much of the literature in fields outside biomedicine sits
   // behind paywalls that a student's university library unlocks.
-  const oaOpts = { requireOA: req.query.includePaywalled !== "1" };
+  const includePaywalled = req.query.includePaywalled === "1";
+  const oaOpts = { requireOA: !includePaywalled };
 
   try {
-    const [supportQuery, counterQuery] = await Promise.all([
-      buildSearchQuery(question),
-      buildCounterQuery(question)
-    ]);
-
-    const [supportFetches, counterFetches] = await Promise.all([
-      Promise.allSettled([searchOpenAlex(supportQuery, oaOpts), searchSemanticScholar(supportQuery, oaOpts), searchEuropePMC(supportQuery, oaOpts), searchCORE(supportQuery, oaOpts), searchDOAJ(supportQuery, oaOpts), searchCrossref(supportQuery, oaOpts), searchERIC(supportQuery, oaOpts)]),
-      Promise.allSettled([searchOpenAlex(counterQuery, oaOpts), searchSemanticScholar(counterQuery, oaOpts), searchEuropePMC(counterQuery, oaOpts), searchCORE(counterQuery, oaOpts), searchDOAJ(counterQuery, oaOpts), searchCrossref(counterQuery, oaOpts), searchERIC(counterQuery, oaOpts)])
-    ]);
-    const labels = ["OpenAlex(support)", "SemanticScholar(support)", "EuropePMC(support)", "CORE(support)", "DOAJ(support)", "Crossref(support)", "ERIC(support)", "OpenAlex(counter)", "SemanticScholar(counter)", "EuropePMC(counter)", "CORE(counter)", "DOAJ(counter)", "Crossref(counter)", "ERIC(counter)"];
-    [...supportFetches, ...counterFetches].forEach((f, i) => {
-      if (f.status === "rejected") console.error(`${labels[i]} failed:`, f.reason?.message || f.reason);
-    });
-
-    const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
-
-    // One list per source, each in the order that source ranked it, tagged
-    // with the angle of the search that found it.
-    const angleLists = (fetches, query, angle) => fetches.map(f =>
-      f.status === "fulfilled"
-        ? requireTermMatch(dateFilter(f.value), [query]).map(p => ({ ...p, angle }))
-        : []
+    const { value, status } = await searchCache.run(
+      searchCacheKey("critical", question, { minYear, includePaywalled }),
+      () => runCriticalSearch(question, minYear, oaOpts),
+      { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
-    const supportLists = angleLists(supportFetches, supportQuery, "support");
-    const counterLists = angleLists(counterFetches, counterQuery, "challenge");
-    const supportRaw = supportLists.reduce((n, l) => n + l.length, 0);
-    const counterRaw = counterLists.reduce((n, l) => n + l.length, 0);
-    // Fuse WITHIN each angle separately (the same paper turning up from
-    // multiple sources for one query), not ACROSS the two angles. This used
-    // to run on both lists merged together with support listed first, so
-    // any paper found by BOTH searches — common whenever the two queries
-    // share vocabulary, which happens a lot on broad or vague questions —
-    // was unconditionally kept as "support" and erased from "challenge".
-    // That silently starved the challenge side before it even reached the
-    // per-angle cap below, which is why a fix there alone (capping support
-    // and challenge separately) wasn't enough on its own. A paper genuinely
-    // relevant to both searches can now appear in both columns rather than
-    // being forced into one; that's a fair trade against hiding real
-    // challenging evidence entirely.
-    const dedupedSupport = fuseRankedLists(supportLists);
-    const dedupedChallenge = fuseRankedLists(counterLists);
-    const supportImportance = landmarkStats(dedupedSupport);
-    const challengeImportance = landmarkStats(dedupedChallenge);
-    // Sized with margin above the 10 actually shown per side (below) —
-    // highlightPapers drops some candidates as not genuinely relevant, so
-    // sending exactly 10 in would often yield fewer than 10 out.
-    const papers = [
-      ...selectCandidates(dedupedSupport, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: supportImportance }),
-      ...selectCandidates(dedupedChallenge, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: challengeImportance })
-    ];
-
-    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportRaw} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterRaw} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
-
-    if (papers.length === 0) {
-      return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
-    }
-
-    const highlighted = await highlightPapers(question, papers);
-    const highlightedSupport = highlighted.filter(p => p.angle === "support").length;
-    const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
-    console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
-    const supports = selectFinal(highlighted.filter(p => p.angle === "support"), { cap: 10, reserve: 2, minSuitability: 50, stats: supportImportance });
-    const challenges = selectFinal(highlighted.filter(p => p.angle === "challenge"), { cap: 10, reserve: 2, minSuitability: 50, stats: challengeImportance });
-
-    // Same principle as /api/search: full-text availability is only
-    // checked on the papers actually being shown (up to 20 here, not the
-    // full candidate pool).
-    const checkFullText = async (list) => mapWithConcurrency(list, 4, async (p) => {
-      try {
-        const pmcid = p.pmcid || await findPmcMatchByDoi(p.doi);
-        if (!pmcid) return p;
-        return { ...p, hasFullText: true, pmcUrl: `https://pmc.ncbi.nlm.nih.gov/articles/${pmcid}/`, pmcid };
-      } catch {
-        return p;
-      }
-    });
-    const [supportsWithFullText, challengesWithFullText] = await Promise.all([
-      checkFullText(supports), checkFullText(challenges)
-    ]);
-
-    // Same re-highlighting step as /api/search: fetch real Methods/Results
-    // excerpts for the (typically small) subset with full text available,
-    // and give Claude a chance to find a more specific quote than the
-    // abstract alone. A paper keeps its existing highlight if this step
-    // fails or comes back empty for it — this only ever adds depth.
-    const combined = [...supportsWithFullText, ...challengesWithFullText];
-    const withExcerpts = await mapWithConcurrency(combined, 4, async (p) => {
-      if (!p.hasFullText) return p;
-      try {
-        const excerpts = await fetchPmcFullText(p.pmcid);
-        if (!excerpts.methodsExcerpt && !excerpts.resultsExcerpt) return p;
-        return { ...p, methodsExcerpt: excerpts.methodsExcerpt, resultsExcerpt: excerpts.resultsExcerpt };
-      } catch {
-        return p;
-      }
-    });
-    const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
-    let finalCombined = withExcerpts;
-    if (toReHighlight.length > 0) {
-      const reHighlighted = await highlightPapers(question, toReHighlight);
-      const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
-      finalCombined = withExcerpts.map(p => byIdRe.get(p.id) || p);
-    }
-    const finalSupports = finalCombined.filter(p => p.angle === "support");
-    const finalChallenges = finalCombined.filter(p => p.angle === "challenge");
-
-    res.json({ supports: finalSupports, challenges: finalChallenges, supportQuery, counterQuery });
+    if (status === "hit") console.log(`[critical] "${question}" answered from the cache`);
+    else if (status === "joined") console.log(`[critical] "${question}" shared a search already running`);
+    res.json(value);
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Critical analysis failed", detail: err.message });
@@ -3151,6 +3277,12 @@ async function runLiteratureSearch(question, { requireOA = true, limit = 20 } = 
     searchERIC(searchQuery, oaOpts),
     searchERIC(question, oaOpts)
   ]);
+  // Same watch on the sources as the main search; the calls here are in pairs
+  // (distilled query, then raw question) rather than in two blocks of seven.
+  sourceHealth.record(tallySources(fetches, [
+    "OpenAlex", "Semantic Scholar", "OpenAlex", "Semantic Scholar", "Europe PMC", "Europe PMC", "CORE", "CORE",
+    "DOAJ", "DOAJ", "Crossref", "Crossref", "ERIC", "ERIC"
+  ]));
   const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(f.value, [searchQuery, question]) : []);
   const allFound = fuseRankedLists(lists);
   const importance = landmarkStats(allFound);
