@@ -33,6 +33,11 @@ import mammoth from "mammoth";
 import pg from "pg";
 import { randomUUID, randomBytes } from "crypto";
 import "dotenv/config";
+import {
+  sanitizeFoldersForAsk, sanitizeAskHistory, formatHistoryBlock, pickDetailPapers,
+  buildVeraSystemPrompt, buildVeraUserContent, parseModelJson, finaliseVeraAnswer
+} from "./vera-context.js";
+import { dedupePapers, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -52,7 +57,20 @@ app.use(helmet());
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 // Stripe signs each webhook over the exact bytes it sent, so that one route
 // must receive the raw body; every other route gets normal JSON parsing.
-app.use((req, res, next) => (req.originalUrl === "/api/stripe-webhook" ? next() : express.json()(req, res, next)));
+//
+// express.json() refuses anything over 100kb by default. That's plenty for a
+// search or a login, but not for the four routes that carry a student's own
+// work: a full-length essay is close to 100kb on its own, and a library of
+// saved papers with their abstracts passes it at around 50-60 papers, which
+// made folder sync and Vera fail for exactly the students who use LitMark most.
+// Only those routes get the larger allowance.
+const jsonDefault = express.json();
+const jsonLarge = express.json({ limit: "3mb" });
+const LARGE_JSON_PATHS = new Set(["/api/library", "/api/ask", "/api/audit-essay", "/api/hit-the-mark"]);
+app.use((req, res, next) => {
+  if (req.originalUrl === "/api/stripe-webhook") return next();
+  return (LARGE_JSON_PATHS.has(req.path) ? jsonLarge : jsonDefault)(req, res, next);
+});
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -827,19 +845,11 @@ function requireTermMatch(papers, queries) {
   return papers;
 }
 
+// Removes duplicates, keeping first-seen order. The matching (a DOI written
+// two ways is still one DOI; a copy without a DOI is matched by title) lives
+// in search-rank.js, which is also what ranks the results.
 function dedupe(papers) {
-  const kept = new Map();
-  for (const p of papers) {
-    const key = (p.doi || p.title || "").toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 60);
-    if (!key) continue;
-    const existing = kept.get(key);
-    if (!existing) { kept.set(key, p); continue; }
-    // Same paper from another source: keep the first, but don't lose the
-    // paper type, citation count or retraction flag if only the duplicate had it.
-    for (const f of ["paperType", "citedByCount", "pmcid"]) if (existing[f] == null && p[f] != null) existing[f] = p[f];
-    if (p.retracted) existing.retracted = true;
-  }
-  return [...kept.values()];
+  return dedupePapers(papers);
 }
 
 // A plain slice(0, N) after concatenating sources in a fixed order silently
@@ -1718,11 +1728,17 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
       else console.log(`${labels[i]}: ${f.value.length} results`);
     });
 
-    const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
     // A paper with no year on record is kept rather than penalized —
     // only papers we KNOW are older than the cutoff are excluded.
-    const dateFiltered = minYear ? allFound.filter(p => !p.year || p.year >= minYear) : allFound;
-    const papers = interleaveBySource(requireTermMatch(dateFiltered, [searchQuery, question])).slice(0, 36);
+    const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
+    // Each of the 14 lists keeps the order its own source ranked it in. Rank
+    // fusion (search-rank.js) combines them: papers several lists found, and
+    // found high up, come first. Then 36 go to the AI step, with room held for
+    // each source's best and for a few important papers (see selectCandidates).
+    const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(dateFilter(f.value), [searchQuery, question]) : []);
+    const allFound = fuseRankedLists(lists);
+    const importance = landmarkStats(allFound);
+    const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
 
     // Breaks candidate counts down by source at each stage — this is what
     // actually shows whether a source is quietly contributing nothing,
@@ -1746,11 +1762,13 @@ app.get("/api/search", requireAuth, rateLimit, async (req, res) => {
     //
     const highlighted = await highlightPapers(question, papers);
     console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
-    // Highest suitability first. Sorting (unlike the old filtering-by-score
-    // approach) never drops a paper — it only changes order — so it doesn't
-    // carry the failure mode that got scoring removed once already.
-    const sorted = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1));
-    const results = sorted.slice(0, 20);
+    // Highest suitability first (ties go to the paper more sources agreed on,
+    // then the more cited). The 20 shown are the 20 most suitable, except that
+    // up to 3 important papers that would have just missed the cut take the
+    // last places, as long as the AI judged them genuinely relevant — so a
+    // landmark paper or key review isn't lost for scoring a few points lower
+    // than twenty narrower ones.
+    const results = selectFinal(highlighted, { cap: 20, reserve: 3, minSuitability: 50, stats: importance });
 
     // Full-text availability is checked only on the papers actually being
     // shown, not the full candidate pool — checking all 36 candidates
@@ -1837,13 +1855,18 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
 
     const dateFilter = list => minYear ? list.filter(p => !p.year || p.year >= minYear) : list;
 
-    const supportPapers = requireTermMatch(
-      dateFilter(supportFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [supportQuery]
-    ).map(p => ({ ...p, angle: "support" }));
-    const counterPapers = requireTermMatch(
-      dateFilter(counterFetches.flatMap(f => f.status === "fulfilled" ? f.value : [])), [counterQuery]
-    ).map(p => ({ ...p, angle: "challenge" }));
-    // Dedupe WITHIN each angle separately (the same paper turning up from
+    // One list per source, each in the order that source ranked it, tagged
+    // with the angle of the search that found it.
+    const angleLists = (fetches, query, angle) => fetches.map(f =>
+      f.status === "fulfilled"
+        ? requireTermMatch(dateFilter(f.value), [query]).map(p => ({ ...p, angle }))
+        : []
+    );
+    const supportLists = angleLists(supportFetches, supportQuery, "support");
+    const counterLists = angleLists(counterFetches, counterQuery, "challenge");
+    const supportRaw = supportLists.reduce((n, l) => n + l.length, 0);
+    const counterRaw = counterLists.reduce((n, l) => n + l.length, 0);
+    // Fuse WITHIN each angle separately (the same paper turning up from
     // multiple sources for one query), not ACROSS the two angles. This used
     // to run on both lists merged together with support listed first, so
     // any paper found by BOTH searches — common whenever the two queries
@@ -1855,17 +1878,19 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     // relevant to both searches can now appear in both columns rather than
     // being forced into one; that's a fair trade against hiding real
     // challenging evidence entirely.
-    const dedupedSupport = dedupe(supportPapers);
-    const dedupedChallenge = dedupe(counterPapers);
+    const dedupedSupport = fuseRankedLists(supportLists);
+    const dedupedChallenge = fuseRankedLists(counterLists);
+    const supportImportance = landmarkStats(dedupedSupport);
+    const challengeImportance = landmarkStats(dedupedChallenge);
     // Sized with margin above the 10 actually shown per side (below) —
     // highlightPapers drops some candidates as not genuinely relevant, so
     // sending exactly 10 in would often yield fewer than 10 out.
     const papers = [
-      ...interleaveBySource(dedupedSupport).slice(0, 20),
-      ...interleaveBySource(dedupedChallenge).slice(0, 20)
+      ...selectCandidates(dedupedSupport, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: supportImportance }),
+      ...selectCandidates(dedupedChallenge, { cap: 20, minPerSource: 1, reserveLandmarks: 2, stats: challengeImportance })
     ];
 
-    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportPapers.length} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterPapers.length} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
+    console.log(`[critical] "${question}" -> support "${supportQuery}" (${supportRaw} raw, ${dedupedSupport.length} deduped) / counter "${counterQuery}" (${counterRaw} raw, ${dedupedChallenge.length} deduped) -> sending ${papers.length} to highlightPapers`);
 
     if (papers.length === 0) {
       return res.json({ supports: [], challenges: [], warning: "No open-access papers found for this query." });
@@ -1875,9 +1900,8 @@ app.get("/api/critical-search", requireAuth, rateLimit, async (req, res) => {
     const highlightedSupport = highlighted.filter(p => p.angle === "support").length;
     const highlightedChallenge = highlighted.filter(p => p.angle === "challenge").length;
     console.log(`[critical] highlightPapers: ${papers.length} in -> ${highlighted.length} out (${highlightedSupport} support, ${highlightedChallenge} challenge)`);
-    const bySuitability = (a, b) => (b.suitability ?? -1) - (a.suitability ?? -1);
-    const supports = highlighted.filter(p => p.angle === "support").sort(bySuitability).slice(0, 10);
-    const challenges = highlighted.filter(p => p.angle === "challenge").sort(bySuitability).slice(0, 10);
+    const supports = selectFinal(highlighted.filter(p => p.angle === "support"), { cap: 10, reserve: 2, minSuitability: 50, stats: supportImportance });
+    const challenges = selectFinal(highlighted.filter(p => p.angle === "challenge"), { cap: 10, reserve: 2, minSuitability: 50, stats: challengeImportance });
 
     // Same principle as /api/search: full-text availability is only
     // checked on the papers actually being shown (up to 20 here, not the
@@ -3127,12 +3151,16 @@ async function runLiteratureSearch(question, { requireOA = true, limit = 20 } = 
     searchERIC(searchQuery, oaOpts),
     searchERIC(question, oaOpts)
   ]);
-  const allFound = dedupe(fetches.flatMap(f => f.status === "fulfilled" ? f.value : []));
-  const papers = interleaveBySource(requireTermMatch(allFound, [searchQuery, question])).slice(0, 36);
+  const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(f.value, [searchQuery, question]) : []);
+  const allFound = fuseRankedLists(lists);
+  const importance = landmarkStats(allFound);
+  const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
   if (papers.length === 0) return { results: [], searchQuery };
   const highlighted = await highlightPapers(question, papers);
-  const sorted = [...highlighted].sort((a, b) => (b.suitability ?? -1) - (a.suitability ?? -1));
-  return { results: sorted.slice(0, limit), searchQuery };
+  // One of a handful of places is held for an important paper, if there is
+  // one the AI judged relevant; with a smaller limit, none is.
+  const results = selectFinal(highlighted, { cap: limit, reserve: limit >= 5 ? 1 : 0, minSuitability: 50, stats: importance });
+  return { results, searchQuery };
 }
 
 // One Claude call does two jobs at once: breaks the (often loosely-worded)
@@ -3466,92 +3494,30 @@ app.post("/api/summarize-folder", requireAuth, rateLimit, async (req, res) => {
 // =====================================================================
 
 const SUPPORT_EMAIL = "litmarkcontactus@gmail.com";
-const MAX_ASK_FOLDERS = 25;
-const MAX_ASK_PAPERS_PER_FOLDER = 25;
-const MAX_ASK_PAPERS_TOTAL = 150;
+// Cleaning the folders, chat history and answer, choosing which saved papers
+// Vera sees in full, and building her prompt all live in vera-context.js, so
+// they can be tested without booting this whole server.
 
-// Folders live only in the student's own browser (localStorage), never on
-// this server, so the client sends along whatever's relevant on every
-// question. Reuses sanitizeFolderPapers' per-paper cleaning so a folder's
-// papers get exactly the same trust/length treatment Citation Audit's
-// "check against a folder" already gives them. Bounded both per-folder and
-// in total, since a long-time student's whole library could otherwise make
-// for a very large prompt.
-function sanitizeFoldersForAsk(raw) {
-  if (!Array.isArray(raw)) return [];
-  const out = [];
-  let total = 0;
-  for (const f of raw.slice(0, MAX_ASK_FOLDERS)) {
-    if (total >= MAX_ASK_PAPERS_TOTAL) break;
-    const name = (f?.name || "").toString().trim().slice(0, 200);
-    if (!name) continue;
-    const remaining = MAX_ASK_PAPERS_TOTAL - total;
-    const papers = (sanitizeFolderPapers(f?.papers) || []).slice(0, Math.min(MAX_ASK_PAPERS_PER_FOLDER, remaining));
-    if (!papers.length) continue;
-    out.push({ name, papers });
-    total += papers.length;
-  }
-  return out;
-}
-
-async function answerCompanionQuestion(question, folders) {
-  const folderBlock = folders.length
-    ? folders.map(f => `FOLDER: "${f.name}"\n${f.papers.map((p, i) => `  [${i}] ${p.title} (${p.authors || "unknown authors"}, ${p.year || "n.d."}) — ${p.journal || ""}\n      ${p.abstract.slice(0, 600)}`).join("\n")}`).join("\n\n")
-    : "(This student has no saved folders yet.)";
-
-  const prompt = `Your name is Vera, the in-app assistant for LitMark, a UK literature-search and citation-checking website for students. If asked your name or who/what you are, say plainly that you're Vera, LitMark's research assistant — never claim to be a human, and don't dodge the question. LitMark's whole identity rests on one non-negotiable rule: it finds and checks real academic sources, but it NEVER writes a student's essay, paragraph, sentence, summary-to-paste, rephrasing, or any other text they could hand in as their own work — however the request is phrased (asked directly, asked "just as an example", asked to "put it in academic language", asked to "continue this thought", asked for "a few bullet points to expand on", asked to "paraphrase this quote for me", etc.). If fulfilling a request would hand the student sentences usable in their coursework, it must be declined, full stop.
-
-LitMark's actual live features — explain these when asked, and ONLY these; never describe a feature that isn't listed here, and never guess at how something works beyond what's written below:
-- Find sources: paste a research question, get real open-access academic papers (via OpenAlex, Semantic Scholar, Europe PMC, CORE, DOAJ, Crossref, ERIC) with the single most relevant sentence highlighted in each, plus a Suitability score (0-100) combining how relevant the paper is and how trustworthy the highlighted quote is. Filters: restrict by publication year, or include papers without free full text (shown by abstract, linked to the publisher page).
-- For & against: compares real evidence supporting and challenging a hypothesis, in two columns, from two separately-run searches, not an after-the-fact AI judgment call.
-- Database Search: turns a research question into a ready-to-paste Boolean search query, correctly formatted for PubMed, Scopus, Web of Science, EBSCOhost, Ovid, or Google Scholar.
-- Check my citations: paste or upload an essay (.docx/.pdf/.txt, up to around 15,000 words); every in-text citation is checked against the real paper it points to and labelled Faithful, Overstated, Misrepresented, Fabricated, or Unable to verify, plus a check that in-text citations match the bibliography.
-- My folders: every saved paper is automatically organised into a folder by the question it came from; a folder's bibliography can be copied in APA, Harvard, MLA, Chicago, Vancouver or IEEE, downloaded as a Word document or PDF, or exported to EndNote/Zotero/Mendeley; a specific paper can be added by DOI; LitMark can summarise what a saved paper offers, or add a personal note to it.
-Subscription is £6/month or £45/year, cancel any time from "Manage subscription".
-
-Below is everything currently saved in this student's own folders. Use it ONLY when the question is about their own research — never claim a paper or finding is saved if it isn't shown here:
-${folderBlock}
-
-The student just asked:
-"${question}"
-
-Decide which ONE of these categories this is, and respond with ONLY a JSON object, nothing else:
-
-{"type": "feature", "answer": "..."} — a question about how a LitMark feature listed above works, answerable confidently from what's given above.
-{"type": "unsure", "answer": "..."} — a question about LitMark itself (pricing, a feature, how something works, troubleshooting, account or billing) that you cannot confidently answer from what's given above. The answer MUST say plainly that you're not sure, and point them to email ${SUPPORT_EMAIL}.
-{"type": "folder", "answer": "...", "referencedFolders": ["exact folder name", ...]} — a question about the student's own research or saved papers. Answer ONLY using the folder contents given above, never inventing a paper or finding that isn't shown. If nothing in their folders is relevant, say so plainly rather than guessing, and leave referencedFolders empty. Every name in referencedFolders must exactly match a folder name given above.
-{"type": "decline", "answer": "..."} — ANY request, however phrased, asking you to generate, draft, write, rephrase, summarise-for-pasting, continue, or otherwise produce text the student could use in their own coursework. The answer should briefly and kindly explain that LitMark finds and checks sources but never writes for you, and offer to help find or explain the sources instead.
-{"type": "off_topic", "answer": "..."} — anything unrelated to LitMark or the student's own research or saved papers (general knowledge, small talk, etc). Say plainly this is outside what you can help with here, scoped to LitMark and their saved research.
-
-Keep "answer" conversational, specific, and under about 80 words.`;
-
+async function answerCompanionQuestion(question, folders, { history = [], omittedPapers = 0 } = {}) {
+  const detailRefs = pickDetailPapers(folders, question, history);
   const msg = await createMessageWithRetry({
     model: MODEL,
     max_tokens: 700,
     temperature: 0, // guardrail-heavy — the decline/scope behaviour needs to
                      // be reliable, not creatively variable
-    messages: [{ role: "user", content: prompt }]
+    system: buildVeraSystemPrompt({ supportEmail: SUPPORT_EMAIL }),
+    messages: [{ role: "user", content: buildVeraUserContent({ question, folders, detailRefs, omittedPapers, history }) }]
   });
-  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(clean);
-  } catch (err) {
+  const parsed = parseModelJson(msg.content.find(b => b.type === "text")?.text);
+  if (!parsed) {
     console.error(`answerCompanionQuestion: JSON parse failed (stop_reason: ${msg.stop_reason})`);
     throw new Error("Couldn't answer that right now — try again in a moment.");
   }
-
-  const TYPES = ["feature", "unsure", "folder", "decline", "off_topic"];
-  const type = TYPES.includes(parsed?.type) ? parsed.type : "off_topic";
-  const answer = (parsed?.answer || "").toString().trim().slice(0, 2000)
-    || `Sorry, I couldn't come up with an answer for that — try again, or email ${SUPPORT_EMAIL}.`;
-  const knownNames = new Set(folders.map(f => f.name));
-  const referencedFolders = type === "folder" && Array.isArray(parsed.referencedFolders)
-    ? [...new Set(parsed.referencedFolders.filter(n => knownNames.has(n)))].slice(0, 5)
-    : [];
-
-  return { type, answer, referencedFolders };
+  return finaliseVeraAnswer(parsed, {
+    types: ["feature", "unsure", "folder", "decline", "off_topic"],
+    folderNames: folders.map(f => f.name),
+    fallback: `Sorry, I couldn't come up with an answer for that — try again, or email ${SUPPORT_EMAIL}.`,
+  });
 }
 
 app.post("/api/ask", requireAuth, rateLimit, async (req, res) => {
@@ -3559,10 +3525,11 @@ app.post("/api/ask", requireAuth, rateLimit, async (req, res) => {
   if (!question) return res.status(400).json({ error: "Missing question" });
   if (question.length > 2000) return res.status(400).json({ error: "That question's a bit long — keep it under 2,000 characters." });
 
-  const folders = sanitizeFoldersForAsk(req.body.folders);
+  const { folders, omittedPapers } = sanitizeFoldersForAsk(req.body.folders);
+  const history = sanitizeAskHistory(req.body.history);
 
   try {
-    const result = await answerCompanionQuestion(question, folders);
+    const result = await answerCompanionQuestion(question, folders, { history, omittedPapers });
     res.json(result);
   } catch (err) {
     console.error(err);
@@ -3594,7 +3561,8 @@ What it actually does:
 - For & against — turn a claim or hypothesis into a genuine two-sided view: real evidence supporting it, and real evidence that challenges it, side by side.
 - Database Search — turn your question into a ready-to-paste, properly-structured Boolean search query for the database your course uses (PubMed, Scopus, Web of Science, EBSCOhost, Ovid or Google Scholar), with the right terms, synonyms, and that database's own field tags.
 - My folders — every paper you save gets automatically organised into a folder by the question it came from. Copy a full bibliography in APA, Harvard, MLA, Chicago, Vancouver or IEEE, download a folder as Word or PDF, or ask LitMark to summarise what a saved paper offers for your question.
-- Check my citations — paste or upload your finished essay (up to roughly 15,000 words), and LitMark checks every citation against the actual source it points to, tagging each Faithful, Overstated, Misrepresented, Fabricated, or Unable to verify. Your essay is never stored.
+- Check my citations — paste or upload your finished essay (up to roughly 15,000 words), and LitMark checks every citation against the actual source it points to. Each one is tagged Faithful (the source supports it), Overstated (the source points the same way but you claim more), Misrepresented (the source says something different, or the opposite), Fabricated (no record of the source anywhere LitMark can search), Not original source (the source is only reporting someone else's earlier finding, so LitMark points you to the original where it can), Debunked (your claim matches the source, but the source has since been retracted or overturned by later research, which isn't your mistake), or Unable to verify (the source couldn't be read well enough to check). You also get an overall Citation Accuracy score, notes on your bibliography, and a check that your in-text citations match your reference list. Your essay is never stored.
+- Hit the Mark — paste or upload your marking criteria or rubric together with your essay, and LitMark marks each criterion Hit, Partly or Missing with a short reason. Where the gap is a lack of evidence, it finds real papers you could read and save to fill it. It never suggests rewording, never writes anything for you, and never predicts a mark. Nothing is stored.
 
 Pricing: £6/month or £45/year (a saving of £27), with a 7-day free trial on either plan — not charged until the trial ends, cancel any time before that from your account.
 
@@ -3605,7 +3573,7 @@ Sources searched: OpenAlex, Semantic Scholar, Europe PMC, CORE, DOAJ, Crossref a
 Who's behind it: an independently built, small project — not a large company. Contact: ${SUPPORT_EMAIL}.
 `.trim();
 
-async function answerPublicQuestion(question) {
+async function answerPublicQuestion(question, history = []) {
   const prompt = `Your name is Vera, the public-facing chat assistant on litmark.org's homepage, for visitors who have NOT signed up or logged in. If asked your name or who/what you are, say plainly that you're Vera, LitMark's research assistant — never claim to be a human, and don't dodge the question. LitMark is a UK literature-search and citation-checking website for students. Its whole identity rests on one non-negotiable rule: it finds and checks real academic sources, but it NEVER writes a student's essay, paragraph, sentence, summary-to-paste, rephrasing, or any other text they could hand in as their own work — however the request is phrased (asked directly, asked "just as an example", asked to "put it in academic language", asked to "continue this thought", asked for "a few bullet points to expand on", asked to "paraphrase this quote for me", etc.). If fulfilling a request would hand the visitor sentences usable in coursework, it must be declined, full stop.
 
 Everything you may say about LitMark must come from the content below — never invent a feature, price, or detail that isn't in it:
@@ -3614,7 +3582,7 @@ ${LITMARK_ABOUT_CONTENT}
 
 This visitor has no account, so you have no access to any saved papers, folders, or research of theirs — you cannot answer anything about "my" work, "my" folder, or "my" essay; that always needs an account.
 
-The visitor just asked:
+${formatHistoryBlock(history)}The visitor just asked:
 "${question}"
 
 Decide which ONE of these categories this is, and respond with ONLY a JSON object, nothing else:
@@ -3624,7 +3592,7 @@ Decide which ONE of these categories this is, and respond with ONLY a JSON objec
 {"type": "decline", "answer": "..."} — ANY request, however phrased, asking you to generate, draft, write, rephrase, summarise-for-pasting, continue, or otherwise produce text they could use in coursework. Briefly and kindly explain LitMark finds and checks sources but never writes for you.
 {"type": "off_topic", "answer": "..."} — anything unrelated to LitMark (general knowledge, small talk, etc). Say plainly this is outside what you can help with here.
 
-Keep "answer" conversational, specific, and under about 70 words.`;
+Keep "answer" conversational, specific, plain text with no markdown, and under about 70 words (up to about 120 only when explaining several tags).`;
 
   const msg = await createMessageWithRetry({
     model: MODEL,
@@ -3632,21 +3600,17 @@ Keep "answer" conversational, specific, and under about 70 words.`;
     temperature: 0,
     messages: [{ role: "user", content: prompt }]
   });
-  const raw = msg.content.find(b => b.type === "text")?.text || "{}";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(clean);
-  } catch (err) {
+  const parsed = parseModelJson(msg.content.find(b => b.type === "text")?.text);
+  if (!parsed) {
     console.error(`answerPublicQuestion: JSON parse failed (stop_reason: ${msg.stop_reason})`);
     throw new Error("Couldn't answer that right now — try again in a moment.");
   }
 
-  const TYPES = ["feature", "needs_account", "decline", "off_topic"];
-  const type = TYPES.includes(parsed?.type) ? parsed.type : "off_topic";
-  const answer = (parsed?.answer || "").toString().trim().slice(0, 1500)
-    || "Sorry, I couldn't come up with an answer for that — try again in a moment.";
-
+  const { type, answer } = finaliseVeraAnswer(parsed, {
+    types: ["feature", "needs_account", "decline", "off_topic"],
+    fallback: "Sorry, I couldn't come up with an answer for that — try again in a moment.",
+    maxWords: 140,
+  });
   return { type, answer };
 }
 
@@ -3678,7 +3642,7 @@ app.post("/api/ask-public", publicAskRateLimit, async (req, res) => {
   if (question.length > 1000) return res.status(400).json({ error: "That question's a bit long — keep it under 1,000 characters." });
 
   try {
-    const result = await answerPublicQuestion(question);
+    const result = await answerPublicQuestion(question, sanitizeAskHistory(req.body.history));
     res.json(result);
   } catch (err) {
     console.error(err);
