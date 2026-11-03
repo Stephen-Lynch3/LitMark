@@ -260,3 +260,37 @@ test("off-topic: if every paper is off-topic the result is empty, not padded wit
   const { dropOffTopic } = await import("./search-rank.js");
   assert.deepEqual(dropOffTopic([{ relevance: 5 }, { relevance: 30 }]), []);
 });
+
+// ---------- locating a quote ----------
+
+test("locate: an exact quote is returned unchanged", async () => {
+  const { locateQuote } = await import("./search-rank.js");
+  assert.equal(locateQuote("It is in decline. The rest follows.", "It is in decline."), "It is in decline.");
+});
+
+test("locate: a quote with a straight apostrophe finds the paper's curly one, and returns the paper's text", async () => {
+  const { locateQuote } = await import("./search-rank.js");
+  const src = "Results showed that effects of human activities on Barbary macaques’ behavior and ecology were large.";
+  const got = locateQuote(src, "effects of human activities on Barbary macaques' behavior and ecology were large.");
+  assert.equal(got, "effects of human activities on Barbary macaques’ behavior and ecology were large.");
+  assert.ok(src.includes(got));
+});
+
+test("locate: dashes, double spaces, line breaks and case do not stop a match", async () => {
+  const { locateQuote } = await import("./search-rank.js");
+  const src = "Rates fell by 50–60%  over\nthree generations in the Rif.";
+  const got = locateQuote(src, "rates fell by 50-60% over three generations");
+  assert.equal(got, "Rates fell by 50–60%  over\nthree generations");
+});
+
+test("locate: a paraphrase, a different sentence or a too-short quote is not matched", async () => {
+  const { locateQuote } = await import("./search-rank.js");
+  const src = "The species declined by more than half over three generations.";
+  assert.equal(locateQuote(src, "The species fell by over 50% across three generations."), null);
+  assert.equal(locateQuote(src, "Totally unrelated sentence about something else."), null);
+  assert.equal(locateQuote(src, "Declined"), null); // too short to trust once it needs tolerant matching
+  assert.equal(locateQuote(src, "declined"), "declined"); // an exact match is always accepted, as before
+  assert.equal(locateQuote(src, ""), null);
+  assert.equal(locateQuote(undefined, "anything at all here"), null);
+  assert.equal(locateQuote(src, null), null);
+});

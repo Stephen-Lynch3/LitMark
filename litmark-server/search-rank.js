@@ -282,3 +282,54 @@ export const MIN_RELEVANCE = 40;
 export function dropOffTopic(papers, min = MIN_RELEVANCE) {
   return papers.filter(p => typeof p.relevance !== "number" || p.relevance >= min);
 }
+
+// ---------- finding the AI's quoted sentence in the source ----------
+// The AI is asked to quote a sentence word for word, and the quote is only
+// shown if it can be found in the paper's own text. Matching had to be
+// character-for-character, so a quote failed whenever the AI "tidied" a
+// character: a curly apostrophe (macaques’) typed back as a straight one, an
+// en dash, a double space, a line break. The paper then appeared with no
+// highlight even though the sentence was right there.
+//
+// This matches ignoring those differences, but always returns the paper's OWN
+// text for the match, never the AI's version, so what is highlighted is exactly
+// what the paper says.
+const fold = (ch) => {
+  if (/\s/.test(ch)) return " ";
+  if ("‘’‚‛′´`".includes(ch)) return "'";
+  if ("“”„‟″".includes(ch)) return '"';
+  if ("‐‑‒–—―−".includes(ch)) return "-";
+  return ch.toLowerCase();
+};
+
+function foldWithMap(text) {
+  let out = "";
+  const map = []; // map[i] = index in the original text of folded char i
+  let lastSpace = true; // drops leading space and collapses runs
+  for (let i = 0; i < text.length; i++) {
+    const c = fold(text[i]);
+    if (c === " ") {
+      if (lastSpace) continue;
+      lastSpace = true;
+    } else {
+      lastSpace = false;
+    }
+    out += c;
+    map.push(i);
+  }
+  return { out, map };
+}
+
+// Returns the exact stretch of `source` that `quote` matches, or null.
+export function locateQuote(source, quote) {
+  if (typeof source !== "string" || typeof quote !== "string") return null;
+  if (source.includes(quote) && quote.trim()) return quote; // the exact case, unchanged
+  const q = foldWithMap(quote).out.replace(/ $/, "");
+  if (q.length < 12) return null; // too short to be sure it is the same sentence
+  const s = foldWithMap(source);
+  const at = s.out.indexOf(q);
+  if (at === -1) return null;
+  const start = s.map[at];
+  const end = s.map[at + q.length - 1] + 1;
+  return source.slice(start, end);
+}

@@ -37,7 +37,7 @@ import {
   sanitizeFoldersForAsk, sanitizeAskHistory, formatHistoryBlock, pickDetailPapers,
   buildVeraSystemPrompt, buildVeraUserContent, parseModelJson, finaliseVeraAnswer
 } from "./vera-context.js";
-import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
+import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, locateQuote, selectCandidates, selectFinal } from "./search-rank.js";
 import { createResponseCache, searchCacheKey } from "./response-cache.js";
 import { createLibraryStore } from "./library-store.js";
 import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
@@ -1074,9 +1074,12 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
       const highlights = rawHighlights
         .map(h => {
           const section = ['abstract','methods','results'].includes(h?.section) ? h.section : 'abstract';
-          return { text: h?.text, reason: typeof h?.reason === "string" ? h.reason : "", section };
+          // The paper's own wording for the quote, found even when the AI
+          // changed a curly apostrophe, dash or spacing (see locateQuote).
+          const text = locateQuote(sourceFor(section), h?.text);
+          return { text, reason: typeof h?.reason === "string" ? h.reason : "", section };
         })
-        .filter(h => h.text && sourceFor(h.section) && sourceFor(h.section).includes(h.text))
+        .filter(h => h.text)
         .slice(0, 2);
       // A paper the model judged worth scoring (it's in the response at
       // all) still surfaces even when every quote it offered fails the
@@ -1978,7 +1981,7 @@ app.get("/api/search", requireAuth, limitFull, async (req, res) => {
     // gets the answer already worked out (see response-cache.js). Admins can add
     // ?fresh=1 to see what a search really returns right now.
     const { value, status } = await searchCache.run(
-      searchCacheKey("search-v2", question, { minYear, includePaywalled }),
+      searchCacheKey("search-v3", question, { minYear, includePaywalled }),
       () => runSearch(question, minYear, oaOpts),
       { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
@@ -2130,7 +2133,7 @@ app.get("/api/critical-search", requireAuth, limitFull, async (req, res) => {
 
   try {
     const { value, status } = await searchCache.run(
-      searchCacheKey("critical-v2", question, { minYear, includePaywalled }),
+      searchCacheKey("critical-v3", question, { minYear, includePaywalled }),
       () => runCriticalSearch(question, minYear, oaOpts),
       { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
