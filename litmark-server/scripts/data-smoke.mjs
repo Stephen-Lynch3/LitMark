@@ -71,12 +71,23 @@ const show = async (label, url) => {
   }
 };
 const base = "https://api.beta.ons.gov.uk/v1";
-const list = await show("dataset list", `${base}/datasets?limit=3`);
-const first = list?.items?.[0];
-if (first?.links?.latest_version?.href) {
-  const version = await show("latest version of the first dataset", first.links.latest_version.href);
-  if (version?.links?.dimensions?.href || version?.dimensions) {
-    await show("its observations, with no filter (shows what it asks for)", `${first.links.latest_version.href}/observations`);
+await show("dataset list (first 3)", `${base}/datasets?limit=3`);
+// cpih01 (consumer price inflation) is the dataset the ONS's own guides use, so
+// it is walked end to end: dataset -> latest version -> dimensions -> options -> observations.
+const ds = await show("dataset cpih01", `${base}/datasets/cpih01`);
+const versionHref = ds?.links?.latest_version?.href;
+if (versionHref) {
+  const version = await show("its latest version", versionHref);
+  const dims = (version?.dimensions || []).map(d => d.name || d.id).filter(Boolean);
+  const picks = {};
+  for (const name of dims) {
+    const opts = await show(`options for dimension "${name}" (first 3)`, `${versionHref}/dimensions/${encodeURIComponent(name)}/options?limit=3`);
+    const first = opts?.items?.[0];
+    picks[name] = first?.option ?? first?.id ?? first?.code ?? "*";
+  }
+  if (dims.length) {
+    const q = dims.map(n => `${encodeURIComponent(n)}=${n.toLowerCase() === "time" ? "*" : encodeURIComponent(picks[n])}`).join("&");
+    await show("observations (time = every period)", `${versionHref}/observations?${q}`);
   }
 }
 console.log("\nDone. Paste all of the above back to Claude.");
