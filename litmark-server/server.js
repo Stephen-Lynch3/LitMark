@@ -219,10 +219,11 @@ function emailFailureHint(message) {
 // also means a dead source used to be invisible. source-health.js counts how
 // many searches in a row each important source has returned nothing for, and
 // emails the owner when one has been quiet for SOURCE_ALERT_AFTER searches
-// (default 5). ALERT_EMAIL (comma-separated) says who; it falls back to
-// ADMIN_EMAILS. SOURCE_ALERT_WATCH changes which sources are watched (default:
+// (default 5). ALERT_EMAIL (comma-separated) says who. It deliberately does
+// not fall back to ADMIN_EMAILS: with ALERT_EMAIL empty, alerts only go to the
+// logs. SOURCE_ALERT_WATCH changes which sources are watched (default:
 // OpenAlex, plus Semantic Scholar if it has an API key, plus "All sources").
-const ALERT_RECIPIENTS = (process.env.ALERT_EMAIL || process.env.ADMIN_EMAILS || "")
+const ALERT_RECIPIENTS = (process.env.ALERT_EMAIL || "")
   .split(",").map(e => e.trim()).filter(Boolean);
 
 const SOURCE_HELP = {
@@ -236,7 +237,7 @@ async function sendSourceAlertEmail(events) {
   const quiet = events.filter(e => e.type === "quiet");
   const back = events.filter(e => e.type === "recovered");
   if (!ALERT_RECIPIENTS.length) {
-    console.error("[source-health] No ALERT_EMAIL or ADMIN_EMAILS is set, so this alert was only written to the logs.");
+    console.error("[source-health] ALERT_EMAIL is not set, so this alert was only written to the logs.");
     return;
   }
   const subject = quiet.length
