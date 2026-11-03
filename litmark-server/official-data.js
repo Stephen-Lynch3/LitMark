@@ -128,6 +128,9 @@ export function parseChoice(text, shortlist) {
 // ---------- Reading the World Bank's responses ----------
 function toCatalogueEntry(raw) {
   if (!raw || typeof raw.id !== "string" || typeof raw.name !== "string") return null;
+  // If an endpoint ignores the source filter, indicators from other databases
+  // come back too; only World Development Indicators are wanted.
+  if (raw.source?.id !== undefined && String(raw.source.id) !== String(WDI_SOURCE)) return null;
   const note = typeof raw.sourceNote === "string" ? raw.sourceNote : "";
   return {
     id: raw.id,
@@ -194,18 +197,34 @@ export function createOfficialData({
     return res.json();
   };
 
+  // The list of World Development Indicators, with each one's definition and
+  // original source. (Checked against the live service: /v2/indicator?source=2 is
+  // rejected, this form works.) A wrong address answers with an error body, not
+  // an HTTP error, which parseCatalogue treats as an empty list.
+  const catalogueUrls = [`${WB_BASE}/sources/${WDI_SOURCE}/indicators?format=json&per_page=2000`];
+  let catalogueUrlFirst = 0;
+
   async function loadCatalogue() {
     if (catalogue && now() - catalogue.at < catalogueTtlMs) return catalogue;
     if (catalogueFailedAt && now() - catalogueFailedAt < failureTtlMs) return null;
     if (!catalogueLoading) {
       catalogueLoading = (async () => {
         try {
-          const body = await getJson(`${WB_BASE}/indicator?format=json&per_page=2000&source=${WDI_SOURCE}`);
-          const parsed = parseCatalogue(body);
-          if (!parsed.entries.length) throw new Error("empty indicator list");
-          catalogue = { ...parsed, at: now() };
-          catalogueFailedAt = 0;
-          return catalogue;
+          let lastError = "empty indicator list";
+          for (let n = 0; n < catalogueUrls.length; n++) {
+            const i = (catalogueUrlFirst + n) % catalogueUrls.length;
+            try {
+              const parsed = parseCatalogue(await getJson(catalogueUrls[i]));
+              if (!parsed.entries.length) { lastError = "empty indicator list"; continue; }
+              catalogueUrlFirst = i;
+              catalogue = { ...parsed, at: now() };
+              catalogueFailedAt = 0;
+              return catalogue;
+            } catch (err) {
+              lastError = err.message;
+            }
+          }
+          throw new Error(lastError);
         } catch (err) {
           catalogueFailedAt = now();
           log.warn?.("[official-data] indicator list unavailable:", err.message);

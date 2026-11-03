@@ -25,7 +25,7 @@ const fetchFn = (url, opts = {}) => fetch(url, { ...opts, signal: AbortSignal.ti
 console.log("=== World Bank ===");
 let catalogue = null;
 try {
-  const res = await fetchFn("https://api.worldbank.org/v2/indicator?format=json&per_page=2000&source=2");
+  const res = await fetchFn("https://api.worldbank.org/v2/sources/2/indicators?format=json&per_page=2000");
   console.log("indicator list:", res.status);
   catalogue = parseCatalogue(await res.json());
   console.log(`  ${catalogue.entries.length} indicators, data last updated ${catalogue.lastUpdatedYear ?? "(not stated)"}`);

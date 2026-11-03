@@ -76,7 +76,7 @@ function fakeBank({ catalogue = catalogueBody(), series = seriesBody(), catalogu
   const state = { catalogueStatus, seriesStatus };
   const fetchFn = async (url) => {
     calls.push(String(url));
-    if (/\/indicator\?/.test(url)) return json(catalogue, state.catalogueStatus);
+    if (/\/sources\/2\/indicators\?/.test(url)) return json(catalogue, state.catalogueStatus);
     if (/\/country\/[A-Za-z]{3}\/indicator\//.test(url)) return json(series, state.seriesStatus);
     return json({}, 404);
   };
@@ -333,7 +333,7 @@ test("23. searches that arrive together share one request for the indicator list
     od.find("How many adults have diabetes in Britain?"),
     od.warm()
   ]);
-  assert.equal(bank.calls.filter(u => /\/indicator\?/.test(u)).length, 1);
+  assert.equal(bank.calls.filter(u => /\/sources\/2\/indicators\?/.test(u)).length, 1);
 });
 
 test("24. an empty or malformed indicator list is treated as unavailable", async () => {
@@ -357,4 +357,26 @@ test("26. a country the service doesn't know (an error body) gives no card", asy
   const bank = fakeBank({ series: [{ message: [{ id: "120", key: "Invalid value", value: "The provided parameter value is not valid" }] }] });
   const od = createOfficialData({ fetchFn: bank.fetchFn, askModel: async () => sayIndicator({ country: "ZZZ" }), log: quiet });
   assert.equal(await od.find(DIABETES_Q), null);
+});
+
+const WB_ERROR = [{ message: [{ id: "120", key: "Invalid value", value: "The provided parameter value is not valid" }] }];
+
+test("27. the World Bank's error body (HTTP 200) for a wrong address is treated as unavailable, not as an empty answer to cache", async () => {
+  const fetchFn = async (url) => (/\/sources\/2\/indicators\?/.test(url) ? json(WB_ERROR) : json({}, 404));
+  const od = createOfficialData({ fetchFn, askModel: async () => sayIndicator(), log: quiet });
+  assert.equal(await od.find(DIABETES_Q), null);
+});
+
+test("28. if every address fails the indicator list is unavailable and there is no card", async () => {
+  const fetchFn = async () => json(WB_ERROR);
+  const od = createOfficialData({ fetchFn, askModel: async () => sayIndicator(), log: quiet });
+  assert.equal(await od.find(DIABETES_Q), null);
+});
+
+test("29. indicators from other World Bank databases are ignored", () => {
+  const body = catalogueBody();
+  body[1] = [...body[1], { id: "XX.OTHER.DB", name: "Diabetes prevalence in another database", source: { id: "57", value: "WDI Database Archives" }, sourceNote: "n", sourceOrganization: "n" }];
+  const { entries } = parseCatalogue(body);
+  assert.ok(!entries.some(e => e.id === "XX.OTHER.DB"));
+  assert.equal(entries.length, INDICATORS.length);
 });
