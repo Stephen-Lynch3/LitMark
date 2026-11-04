@@ -43,6 +43,7 @@ import { createLibraryStore } from "./library-store.js";
 import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
 import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
 import { createOfficialData } from "./official-data.js";
+import { createPrimarySources } from "./primary-sources.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -310,6 +311,24 @@ const officialData = createOfficialData({
     return msg.content.find(b => b.type === "text")?.text || "";
   }
 });
+// The "Legislation" card: for a question about what a UK law says, the wording
+// of the section itself, fetched from legislation.gov.uk. Same rule: the AI only
+// names the provision, and the page that comes back must be the Act it named.
+// See primary-sources.js. PRIMARY_SOURCES=off switches it off.
+const primarySources = createPrimarySources({
+  enabled: process.env.PRIMARY_SOURCES !== "off",
+  fetchFn: (url, opts = {}) => fetch(url, { ...opts, signal: AbortSignal.timeout(12000) }),
+  askModel: async (prompt) => {
+    const msg = await createMessageWithRetry({
+      model: MODEL,
+      max_tokens: 400,
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }]
+    });
+    return msg.content.find(b => b.type === "text")?.text || "";
+  }
+});
+
 // The card is a bonus: it must never hold the papers back. Past this, the
 // search is returned without it (the lookup carries on and is ready next time).
 const OFFICIAL_DATA_DEADLINE_MS = 9000;
@@ -1976,6 +1995,7 @@ app.get("/api/search", requireAuth, limitFull, async (req, res) => {
     // Started first so it runs alongside the paper search, not after it. It
     // never rejects: no figure just means no card.
     const officialPromise = withDeadline(officialData.find(question), OFFICIAL_DATA_DEADLINE_MS);
+    const legislationPromise = withDeadline(primarySources.find(question), OFFICIAL_DATA_DEADLINE_MS);
 
     // The same question from another student, now or within the last few hours,
     // gets the answer already worked out (see response-cache.js). Admins can add
@@ -1990,7 +2010,10 @@ app.get("/api/search", requireAuth, limitFull, async (req, res) => {
 
     // Added to a copy: the cached search result stays exactly as it was.
     const official = await officialPromise;
-    res.json(official ? { ...value, officialData: official } : value);
+    const legislation = await legislationPromise;
+    res.json(official || legislation
+      ? { ...value, ...(official ? { officialData: official } : {}), ...(legislation ? { legislation } : {}) }
+      : value);
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Search failed", detail: err.message });
