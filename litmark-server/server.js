@@ -3774,7 +3774,7 @@ app.post("/api/ask", requireAuth, limitLight, async (req, res) => {
 // sync by eye if either page's copy changes, rather than re-describing
 // the product from scratch here.
 const LITMARK_ABOUT_CONTENT = `
-Mission / hero copy (homepage): "We find it. You write it. Nothing fake." — "Real papers. Honest citations. Nothing invented." LitMark gives students access to 300 million+ papers. £6/month or £45/year after a 7-day free trial (card required, cancel any time before the trial ends).
+Mission / hero copy (homepage): "We find it. You write it. Nothing fake." — "Real papers. Honest citations. Nothing invented." LitMark gives students access to 500 million+ papers. £6/month or £45/year after a 7-day free trial (card required, cancel any time before the trial ends).
 
 About page:
 LitMark is a research and citation tool built for students — not another AI tool that writes your essay for you, but one that helps you find, evaluate, and honestly cite the real evidence behind it.
