@@ -19,6 +19,8 @@
 // Everything outside the network and the model is plain functions, so it can be
 // tested without either: `fetchFn` and `askModel` are passed in.
 
+import { ONS_BASE, buildOnsCard, buildOnsPrompt, mentionsUK, onsSearchUrl, parseOnsChoice, parseOnsData, parseOnsSearch } from "./official-data-ons.js";
+
 const WB_BASE = "https://api.worldbank.org/v2";
 const WDI_SOURCE = 2; // World Development Indicators
 const MIN_CONFIDENCE = 70;
@@ -158,7 +160,7 @@ export function parseSeries(body) {
   if (!rows.length) return null;
   rows.sort((a, b) => b.year - a.year);
   const latest = rows[0];
-  const series = rows.slice(0, SERIES_POINTS).reverse().map(r => ({ year: r.year, value: r.value }));
+  const series = rows.slice(0, SERIES_POINTS).reverse().map(r => ({ t: r.year, label: String(r.year), year: r.year, value: r.value }));
   const m = /(\d{4})/.exec(String(body[0]?.lastupdated || ""));
   return { latest, series, lastUpdatedYear: m ? Number(m[1]) : null };
 }
@@ -193,7 +195,7 @@ export function createOfficialData({
 
   const getJson = async (url) => {
     const res = await fetchFn(url, { headers: { accept: "application/json" } });
-    if (!res.ok) throw new Error(`World Bank ${res.status}`);
+    if (!res.ok) throw new Error(`${/ons\.gov\.uk/.test(url) ? "ONS" : "World Bank"} ${res.status}`);
     return res.json();
   };
 
@@ -266,6 +268,7 @@ export function createOfficialData({
     const url = `https://data.worldbank.org/indicator/${encodeURIComponent(indicator.id)}${iso2 ? `?locations=${encodeURIComponent(iso2)}` : ""}`;
     return {
       provider: "World Bank",
+      providerName: "World Bank",
       indicatorId: indicator.id,
       title: indicator.name,
       geography,
@@ -273,6 +276,7 @@ export function createOfficialData({
       value: latest.value,
       valueText: formatValue(latest.value, indicator.name, latest.decimal),
       year: latest.year,
+      period: String(latest.year),
       series,
       definition: clip(indicator.note, 420),
       originalSource: clip(indicator.org, 160),
@@ -293,6 +297,25 @@ export function createOfficialData({
     };
   }
 
+  // The UK's own statistics, for questions about the UK. Same three outcomes as
+  // lookUp: a card, null (nothing fits) or undefined (couldn't tell right now).
+  async function lookUpOns(question) {
+    const searchUrl = onsSearchUrl(question);
+    if (!searchUrl) return null;
+    const candidates = parseOnsSearch(await getJson(searchUrl));
+    if (!candidates.length) return null;
+
+    const reply = await askModel(buildOnsPrompt(question, candidates));
+    const choice = parseOnsChoice(reply, candidates);
+    if (!choice) return /\{[\s\S]*\}/.test(String(reply || "")) ? null : undefined;
+
+    // The address was checked by parseOnsSearch to be plain path characters, so
+    // it goes in as the ONS's own examples write it.
+    const data = parseOnsData(await getJson(`${ONS_BASE}/data?uri=${choice.series.uri}`));
+    if (!data) return null;
+    return buildOnsCard({ choice, data });
+  }
+
   // Never throws, never blocks for long: the search that called this must not
   // care whether it worked.
   async function find(question) {
@@ -303,8 +326,25 @@ export function createOfficialData({
       const key = q.toLowerCase().replace(/\s+/g, " ").replace(/[?.!\s]+$/, "");
       const hit = answers.get(key);
       if (hit && now() - hit.at < answerTtlMs) return hit.card;
-      const card = await lookUp(q);
-      if (card === undefined) return null;
+      // UK questions try the ONS first and fall back to the World Bank, which
+      // also holds UK figures. A source being unreachable is not "no figure": it
+      // is not remembered, so the next search tries again.
+      let card = null;
+      let unsure = false;
+      if (mentionsUK(q)) {
+        try {
+          const r = await lookUpOns(q);
+          if (r) card = r; else if (r === undefined) unsure = true;
+        } catch (err) {
+          unsure = true;
+          log.warn?.("[official-data] ONS lookup failed:", err.message);
+        }
+      }
+      if (!card) {
+        const r = await lookUp(q);
+        if (r) card = r; else if (r === undefined) unsure = true;
+      }
+      if (!card && unsure) return null;
       remember(key, card);
       return card;
     } catch (err) {
