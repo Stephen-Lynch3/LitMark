@@ -37,7 +37,8 @@ import {
   sanitizeFoldersForAsk, sanitizeAskHistory, formatHistoryBlock, pickDetailPapers,
   buildVeraSystemPrompt, buildVeraUserContent, parseModelJson, finaliseVeraAnswer
 } from "./vera-context.js";
-import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, locateQuote, selectCandidates, selectFinal } from "./search-rank.js";
+import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
+import { cleanAbstractText, parseHighlightReply, reHighlightPapers, resolveHighlights } from "./highlight-utils.js";
 import { createResponseCache, searchCacheKey } from "./response-cache.js";
 import { createLibraryStore } from "./library-store.js";
 import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
@@ -545,7 +546,7 @@ function reconstructAbstract(inverted) {
   for (const [word, idxs] of Object.entries(inverted)) {
     for (const i of idxs) positions[i] = word;
   }
-  const text = positions.join(" ").trim();
+  const text = cleanAbstractText(positions.join(" ")) || "";
   return text.length > 40 ? text : null;
 }
 
@@ -581,7 +582,7 @@ async function searchSemanticScholar(query, { requireOA = true } = {}) {
       doi: p.externalIds?.DOI,
       citedByCount: typeof p.citationCount === "number" ? p.citationCount : null,
       paperType: normalizePaperType(p.publicationTypes || [], p.title),
-      abstract: p.abstract
+      abstract: cleanAbstractText(p.abstract)
     }));
   } catch (err) {
     reportSourceFailure("Semantic Scholar", err);
@@ -646,7 +647,7 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
         r.pubType || "",
         r.source === "PPR" ? "preprint" : ""
       ], r.title),
-      abstract: r.abstractText ? stripXmlTags(r.abstractText) : null
+      abstract: r.abstractText ? cleanAbstractText(r.abstractText, { markup: true }) : null
     };
   }).filter(p => p.abstract && (requireOA ? p.oaUrl : true));
   } catch (err) {
@@ -702,7 +703,7 @@ async function searchCORE(query, { requireOA = true } = {}) {
         doi: w.doi || null,
         citedByCount: typeof w.citationCount === "number" ? w.citationCount : null,
         paperType: normalizePaperType([w.documentType, ...(Array.isArray(w.types) ? w.types : [])], w.title),
-        abstract: w.abstract || null
+        abstract: cleanAbstractText(w.abstract)
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -753,7 +754,7 @@ async function searchDOAJ(query, { requireOA = true } = {}) {
         doi: doiEntry?.id || null,
         citedByCount: null, // DOAJ's metadata doesn't include citation counts
         paperType: normalizePaperType([], bib.title),
-        abstract: bib.abstract || null
+        abstract: cleanAbstractText(bib.abstract)
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -801,9 +802,10 @@ async function searchCrossref(query, { requireOA = true } = {}) {
         || w["published-online"]?.["date-parts"]?.[0]?.[0]
         || null;
       const fulltextLink = (Array.isArray(w.link) ? w.link : []).find(l => l["content-type"] === "text/html" || l["content-type"] === "application/pdf");
-      // A plain abstract field sometimes carries JATS XML tags verbatim —
-      // strip them rather than show a student raw markup.
-      const cleanAbstract = w.abstract ? w.abstract.replace(/<[^>]+>/g, "").trim() : null;
+      // The abstract field carries JATS XML tags verbatim. Strip them rather
+      // than show a student raw markup, turning paragraph breaks into spaces so
+      // two paragraphs don't run together, and dropping the "Abstract" label.
+      const cleanAbstract = w.abstract ? cleanAbstractText(w.abstract, { markup: true }) : null;
       return {
         source: "Crossref",
         id: w.DOI,
@@ -872,7 +874,7 @@ async function searchERIC(query, { requireOA = true } = {}) {
         doi: d.doi || null,
         citedByCount: null, // ERIC's metadata doesn't include citation counts
         paperType: normalizePaperType(Array.isArray(d.publicationtype) ? d.publicationtype : [d.publicationtype], d.title),
-        abstract: d.description || null
+        abstract: cleanAbstractText(d.description)
       };
     })
     .filter(p => p.abstract && (requireOA ? p.oaUrl : true));
@@ -1054,20 +1056,21 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
 
   const msg = await createMessageWithRetry({
     model: MODEL,
-    max_tokens: 3600,
+    max_tokens: 5000, // 12 papers x up to two quotes + reasons; 3600 was close enough to cut the last papers off
     temperature: 0, // relevance/highlight judgment, not creative writing — the
                     // same paper set should get the same verdict every time
     messages: [{ role: "user", content: prompt }]
   });
 
   const raw = msg.content.find(b => b.type === "text")?.text || "[]";
-  const clean = raw.replace(/```json|```/g, "").trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(clean);
-  } catch (err) {
-    console.error(`highlightChunk: JSON parse failed for ${papers.length} papers (stop_reason: ${msg.stop_reason}). First/last 300 chars:`, clean.slice(0, 300), "...", clean.slice(-300));
-    parsed = [];
+  // Reads a clean array, an array with a sentence around it, an object that
+  // wraps it, or one cut off part-way (the complete entries before the cut are
+  // kept). Before this, any of the last three dropped every paper in the chunk.
+  const parsed = parseHighlightReply(raw);
+  if (parsed.length === 0 && raw.replace(/```json|```/g, "").trim() !== "[]") {
+    console.error(`highlightChunk: no readable entries for ${papers.length} papers (stop_reason: ${msg.stop_reason}). First/last 300 chars:`, raw.slice(0, 300), "...", raw.slice(-300));
+  } else if (msg.stop_reason === "max_tokens") {
+    console.warn(`highlightChunk: reply was cut off (max_tokens); kept the ${parsed.length} complete entries of ${papers.length} papers`);
   }
 
   // Keep the original candidate order (OpenAlex/Semantic Scholar's own
@@ -1088,19 +1091,12 @@ Respond with ONLY a JSON array, one object per paper index, in this exact shape,
       // stops a fabricated or misattributed quote from ever reaching the
       // reader, now checked against the right source (abstract, methods,
       // or results) rather than always the abstract.
-      const sourceFor = section => section === 'methods' ? paper.methodsExcerpt
-        : section === 'results' ? paper.resultsExcerpt
-        : paper.abstract;
-      const highlights = rawHighlights
-        .map(h => {
-          const section = ['abstract','methods','results'].includes(h?.section) ? h.section : 'abstract';
-          // The paper's own wording for the quote, found even when the AI
-          // changed a curly apostrophe, dash or spacing (see locateQuote).
-          const text = locateQuote(sourceFor(section), h?.text);
-          return { text, reason: typeof h?.reason === "string" ? h.reason : "", section };
-        })
-        .filter(h => h.text)
-        .slice(0, 2);
+      // resolveHighlights (highlight-utils.js) finds each quote in the paper's
+      // own text and returns the paper's wording, even when the AI changed a
+      // curly apostrophe, dash or spacing (see locateQuote). A quote labelled
+      // with the wrong section is still found if it is really in another part,
+      // and two quotes that overlap become one so no words are shown twice.
+      const highlights = resolveHighlights(rawHighlights, paper);
       // A paper the model judged worth scoring (it's in the response at
       // all) still surfaces even when every quote it offered fails the
       // exact-match check above — that's a quoting failure (paraphrased
@@ -1135,6 +1131,13 @@ async function highlightOnTopic(question, papers) {
   }
   return onTopic;
 }
+
+// The second highlighting pass, for papers whose Methods/Results text was
+// fetched. Matching each result back to its own paper, and keeping the first
+// pass's highlights when the second gives nothing usable, is in
+// highlight-utils.js (reHighlightPapers) where it is tested.
+const reHighlightWithFullText = (question, papers) =>
+  reHighlightPapers(papers, list => highlightPapers(question, list));
 
 // =====================================================================
 // AUTH — passwordless. A signed link proves email ownership; whether
@@ -1972,10 +1975,10 @@ async function runSearch(question, minYear, oaOpts) {
   const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
   let finalResults = withExcerpts;
   if (toReHighlight.length > 0) {
-    const reHighlighted = await highlightPapers(question, toReHighlight);
-    const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
-    finalResults = withExcerpts.map(p => byIdRe.get(p.id) || p);
-    console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates -> ${reHighlighted.length} improved`);
+    const redone = await reHighlightWithFullText(question, toReHighlight);
+    const redoneFor = new Map(toReHighlight.map((p, i) => [p, redone[i]]));
+    finalResults = withExcerpts.map(p => redoneFor.get(p) || p);
+    console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates, ${redone.filter((p, i) => p !== toReHighlight[i]).length} improved`);
   }
 
   return { value: { results: finalResults, searchQuery }, cacheable: quality === "ok" };
@@ -2134,9 +2137,9 @@ async function runCriticalSearch(question, minYear, oaOpts) {
   const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
   let finalCombined = withExcerpts;
   if (toReHighlight.length > 0) {
-    const reHighlighted = await highlightPapers(question, toReHighlight);
-    const byIdRe = new Map(reHighlighted.map(p => [p.id, p]));
-    finalCombined = withExcerpts.map(p => byIdRe.get(p.id) || p);
+    const redone = await reHighlightWithFullText(question, toReHighlight);
+    const redoneFor = new Map(toReHighlight.map((p, i) => [p, redone[i]]));
+    finalCombined = withExcerpts.map(p => redoneFor.get(p) || p);
   }
   const finalSupports = finalCombined.filter(p => p.angle === "support");
   const finalChallenges = finalCombined.filter(p => p.angle === "challenge");

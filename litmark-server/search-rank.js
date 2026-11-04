@@ -294,12 +294,22 @@ export function dropOffTopic(papers, min = MIN_RELEVANCE) {
 // This matches ignoring those differences, but always returns the paper's OWN
 // text for the match, never the AI's version, so what is highlighted is exactly
 // what the paper says.
+// Characters that print as nothing but would stop a quote matching: soft hyphens
+// (publishers hyphenate long words), zero-width spaces, byte-order marks.
+const INVISIBLE = "\u00AD\u200B\u2060\uFEFF";
+
+// One character of the original text becomes zero, one or several folded
+// characters (a ligature "ﬁ" becomes "fi"; "İ" lower-cases to two characters), so
+// foldWithMap records, for every folded character, where in the original it came
+// from. Without that, one such character early in a passage shifted every later
+// position and the wrong stretch of the paper was returned.
 const fold = (ch) => {
+  if (INVISIBLE.includes(ch)) return "";
   if (/\s/.test(ch)) return " ";
   if ("‘’‚‛′´`".includes(ch)) return "'";
   if ("“”„‟″".includes(ch)) return '"';
   if ("‐‑‒–—―−".includes(ch)) return "-";
-  return ch.toLowerCase();
+  return ch.normalize("NFKC").toLowerCase();
 };
 
 function foldWithMap(text) {
@@ -307,15 +317,18 @@ function foldWithMap(text) {
   const map = []; // map[i] = index in the original text of folded char i
   let lastSpace = true; // drops leading space and collapses runs
   for (let i = 0; i < text.length; i++) {
-    const c = fold(text[i]);
-    if (c === " ") {
-      if (lastSpace) continue;
-      lastSpace = true;
-    } else {
-      lastSpace = false;
+    const folded = fold(text[i]);
+    for (let k = 0; k < folded.length; k++) {
+      const c = folded[k];
+      if (c === " ") {
+        if (lastSpace) continue;
+        lastSpace = true;
+      } else {
+        lastSpace = false;
+      }
+      out += c;
+      map.push(i);
     }
-    out += c;
-    map.push(i);
   }
   return { out, map };
 }
