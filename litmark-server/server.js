@@ -44,6 +44,7 @@ import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-l
 import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
 import { createOfficialData } from "./official-data.js";
 import { createPrimarySources } from "./primary-sources.js";
+import { buildLexiconQuery } from "./lexicon-dbs.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -3501,20 +3502,8 @@ app.post("/api/hit-the-mark", requireAuth, limitFull, upload.fields([{ name: "cr
 // query string, with its nested quote marks and field tags, is built
 // mechanically by this code, not generated as a single fragile JSON
 // string value (which failed on more complex questions in practice).
-// Each database writes the same Boolean search differently. These follow each
-// interface's documented syntax: PubMed [tiab] tags; Scopus TITLE-ABS-KEY();
-// Web of Science TS=(); EBSCOhost repeats the field code per term (TI "x" OR
-// AB "x"); Ovid puts a suffix after the term (x.ti,ab.); Google Scholar has no
-// field tags at all, so a plain grouped OR/AND query is the closest thing.
-const quoteTerm = t => t.includes(" ") ? `"${t}"` : t;
-const LEXICON_DBS = {
-  pubmed:  { label: "PubMed",         join: " AND ", concept: ts => "(" + ts.map(t => `${quoteTerm(t)}[tiab]`).join(" OR ") + ")" },
-  scopus:  { label: "Scopus",         join: " AND ", concept: ts => "TITLE-ABS-KEY(" + ts.map(quoteTerm).join(" OR ") + ")" },
-  wos:     { label: "Web of Science", join: " AND ", concept: ts => "TS=(" + ts.map(quoteTerm).join(" OR ") + ")" },
-  ebsco:   { label: "EBSCOhost (PsycINFO, ERIC, CINAHL…)", join: " AND ", concept: ts => "(" + ts.flatMap(t => [`TI ${quoteTerm(t)}`, `AB ${quoteTerm(t)}`]).join(" OR ") + ")" },
-  ovid:    { label: "Ovid (MEDLINE, PsycINFO, Embase…)", join: " and ", concept: ts => "(" + ts.map(quoteTerm).join(" or ") + ").ti,ab." },
-  scholar: { label: "Google Scholar", join: " ",     concept: ts => "(" + ts.map(quoteTerm).join(" OR ") + ")" }
-};
+// Each database writes the same Boolean search differently. The per-database
+// syntax lives in lexicon-dbs.js so it can be tested on its own.
 
 async function generateLexicon(question, db = "pubmed") {
   const prompt = `A student wants to search academic literature databases for literature on this research question:
@@ -3572,10 +3561,9 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
   // Build the actual Boolean query string ourselves, mechanically — no
   // risk of malformed JSON or broken syntax, since this is plain string
   // concatenation, not something an LLM had to get exactly right.
-  const spec = LEXICON_DBS[db] || LEXICON_DBS.pubmed;
-  const query = concepts.map(c => spec.concept(c.terms)).join(spec.join);
+  const built = buildLexiconQuery(concepts, db);
 
-  return { query, concepts, db: LEXICON_DBS[db] ? db : "pubmed", dbLabel: spec.label };
+  return { query: built.query, concepts, db: built.db, dbLabel: built.dbLabel };
 }
 
 // ---------- Summarise a saved source ----------
