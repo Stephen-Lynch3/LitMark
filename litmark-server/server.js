@@ -44,7 +44,7 @@ import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-l
 import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
 import { createOfficialData } from "./official-data.js";
 import { createPrimarySources } from "./primary-sources.js";
-import { buildLexiconQuery } from "./lexicon-dbs.js";
+import { buildLexiconQuery, extractJsonObject } from "./lexicon-dbs.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -3531,7 +3531,7 @@ Respond with ONLY JSON in this exact shape, nothing else — plain terms only, n
     messages: [{ role: "user", content: prompt }]
   });
   const raw = msg.content.find(b => b.type === "text")?.text || "{}";
-  const clean = raw.replace(/```json|```/g, "").trim();
+  const clean = extractJsonObject(raw);
 
   let parsed;
   try {

@@ -52,3 +52,12 @@ export function buildLexiconQuery(concepts, db = "pubmed") {
   const query = concepts.map(c => spec.concept(c.terms)).join(spec.join);
   return { query, db: key, dbLabel: spec.label };
 }
+
+// The model is told to answer with JSON only, but on some questions it adds a
+// sentence before or after. Take the outermost {...} so that still parses.
+export function extractJsonObject(raw) {
+  const text = String(raw || "").replace(/```json|```/g, "").trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  return start !== -1 && end > start ? text.slice(start, end + 1) : text;
+}

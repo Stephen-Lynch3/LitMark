@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { LEXICON_DBS, buildLexiconQuery, hasLexiconDb } from "./lexicon-dbs.js";
+import { LEXICON_DBS, buildLexiconQuery, extractJsonObject, hasLexiconDb } from "./lexicon-dbs.js";
 
 const concepts = [
   { name: "Exercise", terms: ["exercise", "physical activity"] },
@@ -73,4 +73,11 @@ test("10. every database has a label, a join and a builder, and builds a non-emp
     assert.ok(r.query.length > 10, key);
     assert.ok(r.query.includes("exercise"), key);
   }
+});
+
+test("11. JSON still parses when the model adds a sentence around it", () => {
+  const raw = 'Here are the concepts:\n```json\n{"concepts":[{"name":"Loitering","terms":["loitering","vagrancy"]}]}\n```\nHope that helps.';
+  assert.deepEqual(JSON.parse(extractJsonObject(raw)).concepts[0].terms, ["loitering", "vagrancy"]);
+  assert.equal(extractJsonObject('{"a":1}'), '{"a":1}');
+  assert.equal(extractJsonObject(undefined), "");
 });
