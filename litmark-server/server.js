@@ -39,6 +39,7 @@ import {
 } from "./vera-context.js";
 import { dedupePapers, dropOffTopic, fuseRankedLists, landmarkStats, selectCandidates, selectFinal } from "./search-rank.js";
 import { cleanAbstractText, parseHighlightReply, reHighlightPapers, resolveHighlights } from "./highlight-utils.js";
+import { cleanApiKey, doajSafeQuery } from "./source-query.js";
 import { createResponseCache, searchCacheKey } from "./response-cache.js";
 import { createLibraryStore } from "./library-store.js";
 import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
@@ -667,14 +668,16 @@ async function searchEuropePMC(query, { requireOA = true } = {}) {
 // search simply proceeds on the other three sources, exactly as it
 // already does when any one source fails for any other reason.
 async function searchCORE(query, { requireOA = true } = {}) {
-  if (!process.env.CORE_API_KEY) return [];
+  const coreKey = cleanApiKey(process.env.CORE_API_KEY);
+  if (!coreKey) return [];
   try {
   const url = new URL("https://api.core.ac.uk/v3/search/works");
   url.searchParams.set("q", query);
   url.searchParams.set("limit", "30");
-  const headers = { Authorization: `Bearer ${process.env.CORE_API_KEY}` };
+  const headers = { Authorization: `Bearer ${coreKey}` };
 
   const res = await fetchWithRetry(url, { headers });
+  if (res.status === 401 || res.status === 403) throw new Error(`CORE ${res.status}: CORE refused the API key. Check CORE_API_KEY in Render (no spaces or quote marks), or get a new free key at core.ac.uk/services/api`);
   if (!res.ok) throw new Error(`CORE ${res.status}`);
   const data = await res.json();
 
@@ -723,11 +726,16 @@ async function searchCORE(query, { requireOA = true } = {}) {
 // never actually excludes anything here the way it can for other sources.
 async function searchDOAJ(query, { requireOA = true } = {}) {
   try {
-  const url = new URL(`https://doaj.org/api/search/articles/${encodeURIComponent(query)}`);
+  // DOAJ reads the query as Lucene syntax with wildcards switched off, so the
+  // "?" at the end of a typical question gets the request refused (HTTP 400).
+  // Only plain words are sent. See source-query.js.
+  const words = doajSafeQuery(query);
+  if (!words) return [];
+  const url = new URL(`https://doaj.org/api/search/articles/${encodeURIComponent(words)}`);
   url.searchParams.set("pageSize", "30");
 
   const res = await fetchWithRetry(url);
-  if (!res.ok) throw new Error(`DOAJ ${res.status}`);
+  if (!res.ok) throw new Error(`DOAJ ${res.status} for "${words.slice(0, 80)}"`);
   const data = await res.json();
 
   return (data.results || [])
@@ -2602,7 +2610,7 @@ async function fullTextExcerpts(paper) {
   }
 }
 
-const searchedDatabases = () => ["OpenAlex", "Semantic Scholar", "Europe PMC", ...(process.env.CORE_API_KEY ? ["CORE"] : []), "Crossref"];
+const searchedDatabases = () => ["OpenAlex", "Semantic Scholar", "Europe PMC", ...(cleanApiKey(process.env.CORE_API_KEY) ? ["CORE"] : []), "Crossref"];
 const defaultDeps = () => ({ lookupPaper, doiRegistration, crossrefLookup, verifyCitation, fullTextExcerpts, findDebunkingPaper });
 
 // Works out whether the cited source exists, and if so whether there's an
