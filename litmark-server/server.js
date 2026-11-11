@@ -42,6 +42,7 @@ import { cleanAbstractText, parseHighlightReply, reHighlightPapers, resolveHighl
 import { cleanApiKey, doajSafeQuery } from "./source-query.js";
 import { createResponseCache, searchCacheKey } from "./response-cache.js";
 import { createLibraryStore } from "./library-store.js";
+import { cleanFeedback, createFeedbackStore } from "./cancel-feedback.js";
 import { COSTS, createRateLimiter, createUsageStore, parseLimit } from "./rate-limit.js";
 import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tallySources } from "./source-health.js";
 import { createOfficialData } from "./official-data.js";
@@ -142,6 +143,14 @@ async function ensureLibrarySchema() {
   }
 }
 ensureLibrarySchema();
+
+// Why people cancel (the "Before you go" question). See cancel-feedback.js.
+const feedbackStore = dbPool ? createFeedbackStore(dbPool) : null;
+if (feedbackStore) {
+  feedbackStore.ensureSchema()
+    .then(() => console.log("[startup] cancel feedback table ready"))
+    .catch(err => console.error("[startup] could not set up the cancel feedback table:", err.message));
+}
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "you@example.com";
 // OpenAlex's free daily credit allowance without a key is small and shared
@@ -1858,6 +1867,24 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Admin accounts don't have a billing subscription to manage." });
   }
   try {
+    // ?cancel=1 opens Stripe's page already on the "cancel subscription" step.
+    // If that can't be done for any reason, the normal billing page opens instead.
+    if (req.query.cancel === "1") {
+      try {
+        const subs = await stripe.subscriptions.list({ customer: req.customerId, status: "all", limit: 5 });
+        const sub = subs.data.find(x => ["active", "trialing", "past_due"].includes(x.status));
+        if (sub) {
+          const direct = await stripe.billingPortal.sessions.create({
+            customer: req.customerId,
+            return_url: APP_URL,
+            flow_data: { type: "subscription_cancel", subscription_cancel: { subscription: sub.id } }
+          });
+          return res.json({ url: direct.url });
+        }
+      } catch (err) {
+        console.warn("[billing] could not open the cancel step directly, using the normal page:", err.message);
+      }
+    }
     const portal = await stripe.billingPortal.sessions.create({
       customer: req.customerId,
       return_url: APP_URL
@@ -1866,6 +1893,32 @@ app.get("/api/billing-portal", requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Could not open billing portal", detail: err.message });
+  }
+});
+
+// ---------- "Before you go": why someone is cancelling ----------
+app.post("/api/cancel-feedback", requireAuth, limitLight, async (req, res) => {
+  if (!feedbackStore) return res.status(503).json({ error: "Feedback isn't set up on the server yet." });
+  const checked = cleanFeedback(req.body);
+  if (!checked.ok) return res.status(400).json({ error: checked.error });
+  try {
+    await feedbackStore.add(req.email, checked.value);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("cancel-feedback failed:", err.message);
+    res.status(502).json({ error: "Couldn't save that just now." });
+  }
+});
+
+// For the owner only: counts per reason and the latest comments.
+app.get("/api/admin/cancel-feedback", requireAuth, async (req, res) => {
+  if (!isAdminEmail(req.email)) return res.status(403).json({ error: "Not allowed." });
+  if (!feedbackStore) return res.status(503).json({ error: "Feedback isn't set up on the server yet." });
+  try {
+    res.json(await feedbackStore.summary(parseInt(req.query.limit, 10) || 50));
+  } catch (err) {
+    console.error("cancel-feedback summary failed:", err.message);
+    res.status(502).json({ error: "Couldn't read the feedback." });
   }
 });
 
