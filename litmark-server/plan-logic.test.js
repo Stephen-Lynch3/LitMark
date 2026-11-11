@@ -100,14 +100,15 @@ test("9. a retracted paper, a study protocol, a weak fit, or a paper with no che
   assert.equal(r.mostCited.length, 0);
 });
 
-test("10. the same paper twice is shown once; a non-web link is dropped", () => {
+test("10. the same paper twice is shown once; a non-web link is dropped (the DOI link is used instead)", () => {
   const r = pickKeyPapers([
     mk({ title: "Same", doi: "10.1/ABC", paperType: "Review", url: "javascript:alert(1)" }),
     mk({ title: "Same again", doi: "10.1/abc", paperType: "Review" }),
     mk({ title: "Other", paperType: "Review", url: "https://doi.org/10.1/x" })
   ]);
   assert.equal(r.reviews.length, 2);
-  assert.equal(r.reviews.find(p => p.title === "Same").url, null);
+  assert.equal(r.reviews.find(p => p.title === "Same").url, "https://doi.org/10.1/ABC");
+  assert.equal(pickKeyPapers([mk({ title: "NoDoi", paperType: "Review", url: "javascript:alert(1)" })]).reviews[0].url, null);
   assert.equal(r.reviews.find(p => p.title === "Other").url, "https://doi.org/10.1/x");
 });
 
