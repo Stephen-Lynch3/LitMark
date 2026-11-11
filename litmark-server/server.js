@@ -699,7 +699,11 @@ async function searchCORE(query, { requireOA = true } = {}) {
         // Different CORE docs/examples show this field two different ways
         // (yearPublished vs year) — checking both rather than betting on one.
         year: w.yearPublished || w.year || null,
-        journal: (Array.isArray(w.journals) && w.journals[0]) || w.publisher || "Unknown venue",
+        // CORE gives journals as objects ({ title, identifiers }), not strings, which
+        // showed up on screen as "[object Object]".
+        journal: (Array.isArray(w.journals) && (typeof w.journals[0] === "string" ? w.journals[0] : w.journals[0]?.title))
+          || (typeof w.publisher === "string" ? w.publisher : w.publisher?.name)
+          || "Unknown venue",
         authors: coreAuthorList.slice(0, 4).map(a => a.given ? `${a.given} ${a.family}` : a.family).join(", "),
         authorList: coreAuthorList,
         authorTotal: rawNames.length,
