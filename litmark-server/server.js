@@ -3948,7 +3948,7 @@ app.post("/api/summarize-folder", requireAuth, limitHalf, async (req, res) => {
 // everywhere else, not just pattern-matched against the word "write".
 // =====================================================================
 
-const SUPPORT_EMAIL = "litmarkcontactus@gmail.com";
+const SUPPORT_EMAIL = "s.lynch@litmark.org";
 // Cleaning the folders, chat history and answer, choosing which saved papers
 // Vera sees in full, and building her prompt all live in vera-context.js, so
 // they can be tested without booting this whole server.
