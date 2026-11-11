@@ -25,7 +25,7 @@
 //
 // Kept apart from server.js so it can be unit-tested: `npm test`.
 
-const REVIEW_TYPES = new Set(["Systematic review", "Meta-analysis", "Review"]);
+export const REVIEW_TYPES = new Set(["Systematic review", "Meta-analysis", "Review"]);
 
 // ---------------------------------------------------------------------
 // Recognising the same paper across sources

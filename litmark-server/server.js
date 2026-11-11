@@ -47,6 +47,8 @@ import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tal
 import { createOfficialData } from "./official-data.js";
 import { createPrimarySources } from "./primary-sources.js";
 import { buildLexiconQuery, extractJsonObject } from "./lexicon-dbs.js";
+import { assemblePlan, bodySectionRange, cleanOutline, cleanPlanInput, parseOutlineReply, pickKeyPapers } from "./plan-logic.js";
+import { buildDocx, docxFilename } from "./plan-docx.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -2178,6 +2180,93 @@ app.get("/api/critical-search", requireAuth, limitFull, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(502).json({ error: "Critical analysis failed", detail: err.message });
+  }
+});
+
+// ---------- Plan: key papers and a suggested outline, as a Word file ----------
+// The student gives their question, word count and a few details. They get a
+// one-page plan: the reviews and most-cited papers to read first, then a
+// suggested outline with a word budget for each section.
+//
+// Who does what (same rule as the rest of LitMark): the code picks the papers
+// (from the same search, and the same cache entry, as the Find sources tab), reads
+// the review label and citation count from the databases, takes each quote from a
+// highlight already checked word for word against the paper, and does the word
+// budget. The AI only suggests section headings and a search per section, and
+// every one of those is checked in plan-logic.js before it is used. Nothing in a
+// plan is a sentence of the student's essay.
+async function suggestOutline(input, picks, range) {
+  const papers = [...picks.reviews, ...picks.mostCited];
+  const list = papers.length
+    ? papers.map(p => `${p.ref}: "${p.title}" (${p.paperType || "paper"}${p.year ? ", " + p.year : ""}). Key sentence: "${p.quote.text}"`).join("\n")
+    : "(no key papers were found: leave every anchors list empty)";
+  const msg = await createMessageWithRetry({
+    model: MODEL,
+    max_tokens: 1600,
+    temperature: 0.3,
+    messages: [{
+      role: "user",
+      content: `A student is planning a ${input.wordCount}-word ${input.type.toLowerCase()}.
+Question or title: "${input.question}"
+${input.year ? `Year of study: ${input.year}\n` : ""}${input.subject ? `Subject: ${input.subject}\n` : ""}${input.brief ? `From their brief: "${input.brief}"\n` : ""}
+Papers the student has been given to start with:
+${list}
+
+Suggest between ${range.min} and ${range.max} sections for the main body. Do not include an introduction or a conclusion: those are added separately. Put the sections in the order an argument would build, and name each one the way a student would name a heading in their own essay (for example "Time-restricted eating" or "Weight loss as a confounder", never "Discussion of key findings"). If the brief asks for critical evaluation, or the question is a debate, include a section on where the evidence disagrees or its limits.
+
+Return ONLY a JSON array, one object per section:
+[{"heading": "short topic name", "cover": "one sentence saying what the student should cover in this section", "anchors": ["R1"], "weight": 1-10, "query": "4-8 keywords for finding more sources for this section"}]
+
+Rules:
+- "cover" describes the task, never what the evidence shows. Do not state any finding, number or claim. Do not write any sentence the student could paste into their essay.
+- "anchors" lists the refs (like R1 or C2) of the papers above that best fit the section. At most 2, only refs from the list, or [] if none fit.
+- "weight" is how long the section should be relative to the others.`
+    }]
+  });
+  return msg.content.find(b => b.type === "text")?.text || "";
+}
+
+app.post("/api/plan", requireAuth, limitFull, async (req, res) => {
+  const parsed = cleanPlanInput(req.body);
+  if (!parsed.ok) return res.status(400).json({ error: parsed.error });
+  const input = parsed.value;
+
+  try {
+    // The same search as the Find sources tab, through the same cache: a student
+    // who has just searched this question gets the papers without a second search.
+    const { value } = await searchCache.run(
+      searchCacheKey("search-v3", input.question, { minYear: null, includePaywalled: false }),
+      () => runSearch(input.question, null, { requireOA: true })
+    );
+    const results = Array.isArray(value?.results) ? value.results : [];
+    if (results.length === 0) {
+      return res.status(404).json({ error: "No papers were found for that question, so there is nothing to plan from. Try rewording it." });
+    }
+
+    const picks = pickKeyPapers(results);
+    const refs = new Set([...picks.reviews, ...picks.mostCited].map(p => p.ref));
+    const range = bodySectionRange(input.wordCount);
+    let body = [];
+    try {
+      body = cleanOutline(parseOutlineReply(await suggestOutline(input, picks, range)), refs, { min: Math.max(2, range.min - 1), max: range.max });
+    } catch (err) {
+      // No headings is a smaller plan, not a failed one: the papers are still real and useful.
+      console.error("[plan] outline step failed:", err?.message || err);
+    }
+    const plan = assemblePlan(input, picks, body);
+    console.log(`[plan] "${input.question}" (${input.wordCount} words) -> ${picks.reviews.length} reviews, ${picks.mostCited.length} most cited, ${body.length} sections`);
+
+    // Built here and sent with the plan, so the Download button needs no second request.
+    let docx = null;
+    try {
+      docx = { filename: docxFilename(plan), base64: buildDocx(plan).toString("base64") };
+    } catch (err) {
+      console.error("[plan] could not write the Word file:", err?.message || err);
+    }
+    res.json({ plan, docx });
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: "Plan failed", detail: err.message });
   }
 });
 

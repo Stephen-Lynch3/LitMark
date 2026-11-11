@@ -63,7 +63,7 @@ function tryParse(s) {
 
 // A reply cut off part-way (the model ran out of room) still holds complete
 // entries before the cut. Walk the array and keep each object that closed.
-function salvageObjects(text) {
+export function salvageObjects(text) {
   const out = [];
   const start = text.indexOf("[");
   if (start === -1) return out;
