@@ -205,7 +205,9 @@ function buildBody(plan, linkId) {
     const titleXml = p.url ? `<w:hyperlink r:id="${linkId(p.url)}">${titleRun}</w:hyperlink>` : titleRun;
     const meta = [p.cite, p.journal].filter(Boolean).join(", ");
     return (
-      para(titleXml + run("  ") + run(`\u00a0${badge.replace(/ /g, "\u00a0")}\u00a0`, { b: true, size: 7.5, color: "FFFFFF", fill: badge.startsWith("Cited") ? INK : BLUE }), { before: 80, after: 10, keepNext: true }) +
+      para(titleXml + run("  ") + (badge.startsWith("Cited")
+        ? run(badge.replace(/ /g, "\u00a0"), { size: 8.5, color: SOFT })
+        : run(`\u00a0${badge.replace(/ /g, "\u00a0")}\u00a0`, { b: true, size: 7.5, color: "FFFFFF", fill: BLUE })), { before: 80, after: 10, keepNext: true }) +
       (meta ? para(run(meta, { size: 8.5, color: SOFT }), { after: 20, keepNext: true }) : "") +
       para(run("“" + p.quote.text + "”", { size: 9.5, color: INK, fill: LIME }), { after: 40 })
     );
