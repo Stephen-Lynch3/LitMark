@@ -131,3 +131,21 @@ test("8. a long plan (ten sections, long quotes) still builds", () => {
   assertWellFormed(files["word/document.xml"], "document");
   assert.equal(plan.outlineTotal, 12000);
 });
+
+test("9. every Find more search is a link that opens that search in LitMark, carrying the question", () => {
+  const plan = samplePlan();
+  const files = readZip(buildDocx(plan));
+  const rels = files["word/_rels/document.xml.rels"];
+  const withQuery = plan.outline.filter(s => s.query);
+  assert.ok(withQuery.length > 0);
+  for (const s of withQuery) {
+    const expected = `https://litmark.org/app/?find=${encodeURIComponent(s.query)}&amp;folder=${encodeURIComponent(plan.question)}`;
+    assert.ok(rels.includes(`Target="${expected}"`), `link for "${s.query}"`);
+  }
+  assert.ok(rels.includes('Target="https://litmark.org"'));
+  // text from the AI cannot break out of the link
+  const evil = samplePlan();
+  evil.outline[0].query = 'x" onload="alert(1) & <b>';
+  const files2 = readZip(buildDocx(evil));
+  assert.ok(!files2["word/_rels/document.xml.rels"].includes('onload="alert'));
+});

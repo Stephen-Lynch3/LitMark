@@ -169,6 +169,12 @@ function niceDate(iso) {
   return Number.isNaN(d.getTime()) ? String(iso ?? "") : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 }
 
+// A link that opens this search in LitMark (in a new tab). The question goes with
+// it so papers the student saves there land in a folder named after it.
+export function findUrl(query, question) {
+  return `https://litmark.org/app/?find=${encodeURIComponent(String(query ?? "").slice(0, 200))}&folder=${encodeURIComponent(String(question ?? "").slice(0, 400))}`;
+}
+
 function buildBody(plan, linkId) {
   const out = [];
   const typeName = String(plan.type || "Essay");
@@ -239,7 +245,7 @@ function buildBody(plan, linkId) {
         cell(w[1], para(run(fmt(s.words), { b: true, size: 9, color: INK }), { align: "right" }), { borders: line, margins: "60 80 60 80" }),
         cell(w[2], para(run(s.cover, { size: 9, color: INK })), { borders: line, margins: "60 80 60 80" }),
         cell(w[3], para(run(start, { size: 9, color: INK })), { borders: line, margins: "60 80 60 80" }),
-        cell(w[4], para(run(s.query || "", { size: 9, color: BLUE })), { borders: line, margins: "60 80 60 80" })
+        cell(w[4], para(s.query ? `<w:hyperlink r:id="${linkId(findUrl(s.query, plan.question))}">${run(s.query, { size: 9, color: BLUE, u: true })}</w:hyperlink>` : ""), { borders: line, margins: "60 80 60 80" })
       ].join("");
     });
     const total = [
@@ -254,7 +260,7 @@ function buildBody(plan, linkId) {
   out.push(para(
     run("A plan, not a draft. ", { b: true, size: 8, color: SOFT }) +
     run("LitMark does not write any of your essay. Check your university's rules on using AI to help with planning.", { size: 8, color: SOFT }) +
-    tab() + run("litmark.org", { size: 8, color: SOFT }),
+    tab() + `<w:hyperlink r:id="${linkId("https://litmark.org")}">${run("litmark.org", { size: 8, color: SOFT, u: true })}</w:hyperlink>`,
     { before: 240, border: { side: "top", color: "DDDDDD", size: 6 }, rightTab: CONTENT_WIDTH }
   ));
   return out.join("");
