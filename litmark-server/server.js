@@ -49,6 +49,7 @@ import { createPrimarySources } from "./primary-sources.js";
 import { buildLexiconQuery, extractJsonObject } from "./lexicon-dbs.js";
 import { assemblePlan, bodySectionRange, cleanOutline, cleanPlanInput, parseOutlineReply, pickKeyPapers } from "./plan-logic.js";
 import { buildDocx, docxFilename } from "./plan-docx.js";
+import { addAuthorCandidates, authorFirst, authorMatches, buildAuthorPrompt, cleanAuthorNames, stripAuthorNames } from "./author-search.js";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB max
 
@@ -357,6 +358,24 @@ async function buildSearchQuery(question) {
   return raw.trim().replace(/^["']|["']$/g, "") || question;
 }
 
+// A student may type a researcher's name ("Cudzik trauma models"). Returns the
+// names, each checked to be in what they typed. Any failure means "no names":
+// the search then runs exactly as it did before.
+async function detectAuthorNames(question) {
+  try {
+    const msg = await createMessageWithRetry({
+      model: MODEL,
+      max_tokens: 60,
+      temperature: 0,
+      messages: [{ role: "user", content: buildAuthorPrompt(question) }]
+    });
+    return cleanAuthorNames(msg.content.find(b => b.type === "text")?.text || "[]", question);
+  } catch (err) {
+    console.warn("detectAuthorNames failed:", err?.message || err);
+    return [];
+  }
+}
+
 // A second query deliberately aimed at literature that would challenge or
 // complicate a hypothesis about this question — null results, contradicting
 // findings, failed replications, limitations. Used only for Critical
@@ -492,11 +511,52 @@ function normalizePaperType(rawList, title = "") {
 }
 
 // ---------- Source 1: OpenAlex ----------
-async function searchOpenAlex(query, { requireOA = true } = {}) {
+// The author-name searches. Each one only finds candidates: nothing counts as
+// "by this author" until authorMatches has checked the paper's own author list.
+async function findOpenAlexAuthorIds(name) {
+  try {
+    const url = new URL("https://api.openalex.org/authors");
+    url.searchParams.set("search", name);
+    url.searchParams.set("per-page", "5");
+    url.searchParams.set("select", "id,display_name");
+    url.searchParams.set("mailto", CONTACT_EMAIL);
+    if (OPENALEX_API_KEY) url.searchParams.set("api_key", OPENALEX_API_KEY);
+    const res = await fetchWithRetry(url);
+    if (!res.ok) throw new Error(`OpenAlex authors ${res.status}`);
+    const data = await res.json();
+    return (data.results || [])
+      .filter(a => authorMatches({ authors: a.display_name }, [name]))
+      .map(a => String(a.id || "").split("/").pop())
+      .filter(id => /^A\d+$/.test(id))
+      .slice(0, 3);
+  } catch (err) {
+    reportSourceFailure("OpenAlex", err);
+    return [];
+  }
+}
+
+async function searchOpenAlexByAuthor(name, topicQuery, oaOpts) {
+  const ids = await findOpenAlexAuthorIds(name);
+  if (!ids.length) return [];
+  const [onTopic, all] = await Promise.all([
+    searchOpenAlex(topicQuery, { ...oaOpts, authorIds: ids }),
+    searchOpenAlex("", { ...oaOpts, authorIds: ids })
+  ]);
+  return [...onTopic, ...all];
+}
+
+const authorSources = (name, topicQuery, oaOpts) => [
+  searchOpenAlexByAuthor(name, topicQuery, oaOpts),
+  searchEuropePMC(`AUTH:"${name.replace(/["\\]/g, "")}"`, oaOpts),
+  searchCrossref(topicQuery, { ...oaOpts, author: name })
+];
+
+async function searchOpenAlex(query, { requireOA = true, authorIds = null } = {}) {
   try {
   const url = new URL("https://api.openalex.org/works");
-  url.searchParams.set("search", query);
+  if (query) url.searchParams.set("search", query);
   const filters = ["has_abstract:true"];
+  if (Array.isArray(authorIds) && authorIds.length) filters.push(`authorships.author.id:${authorIds.join("|")}`);
   if (requireOA) filters.push("open_access.is_oa:true");
   url.searchParams.set("filter", filters.join(","));
   url.searchParams.set("per-page", "30");
@@ -793,10 +853,11 @@ async function searchDOAJ(query, { requireOA = true } = {}) {
 // oaUrl is only set when requireOA is false — otherwise this source
 // correctly contributes nothing to an open-access-only search, the same
 // way any source would if it had no OA content to offer.
-async function searchCrossref(query, { requireOA = true } = {}) {
+async function searchCrossref(query, { requireOA = true, author = null } = {}) {
   try {
   const url = new URL("https://api.crossref.org/works");
-  url.searchParams.set("query", query);
+  if (query) url.searchParams.set("query", query);
+  if (author) url.searchParams.set("query.author", author);
   url.searchParams.set("rows", "30");
   url.searchParams.set("mailto", CONTACT_EMAIL); // joins Crossref's faster "polite pool"
 
@@ -1876,7 +1937,11 @@ async function runSearch(question, minYear, oaOpts) {
     searchERIC(question, oaOpts)
   ];
 
-  const searchQuery = await buildSearchQuery(question);
+  // A name in the question is looked for separately, by author. Detected at the
+  // same time as the keyword query, so it adds no waiting.
+  const [distilled, authorNames] = await Promise.all([buildSearchQuery(question), detectAuthorNames(question)]);
+  const searchQuery = authorNames.length ? stripAuthorNames(distilled, authorNames) : distilled;
+  const authorFetchPromises = authorNames.flatMap(n => authorSources(n, searchQuery, oaOpts));
 
   // Two nets, not one: the distilled keyword query catches precise
   // matches, but a narrowed query can miss papers a broader phrasing
@@ -1916,9 +1981,17 @@ async function runSearch(question, minYear, oaOpts) {
   // found high up, come first. Then 36 go to the AI step, with room held for
   // each source's best and for a few important papers (see selectCandidates).
   const lists = fetches.map(f => f.status === "fulfilled" ? requireTermMatch(dateFilter(f.value), [searchQuery, question]) : []);
+  // Author-name results only count if the paper's own authors include the name.
+  if (authorFetchPromises.length) {
+    const authorFetched = await Promise.allSettled(authorFetchPromises);
+    authorFetched.forEach(f => lists.push(f.status === "fulfilled" ? dateFilter(f.value).filter(p => authorMatches(p, authorNames)) : []));
+    console.log(`[search] author search for ${authorNames.join(", ")}: ${lists.slice(-authorFetchPromises.length).reduce((n, l) => n + l.length, 0)} papers by that name`);
+  }
   const allFound = fuseRankedLists(lists);
   const importance = landmarkStats(allFound);
-  const papers = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
+  const selected = selectCandidates(allFound, { cap: 36, minPerSource: 2, reserveLandmarks: 4, stats: importance });
+  // Papers by the named author the topic selection left out still get judged.
+  const papers = authorNames.length ? addAuthorCandidates(selected, allFound, authorNames, 8) : selected;
 
   // Breaks candidate counts down by source at each stage — this is what
   // actually shows whether a source is quietly contributing nothing,
@@ -1940,7 +2013,10 @@ async function runSearch(question, minYear, oaOpts) {
   // picking a highlight. Failures here just fall back to abstract-only
   // for that one paper; they never break the search.
   //
-  const highlighted = await highlightOnTopic(question, papers);
+  // The AI judges relevance by topic; tell it a named author is wanted, so a paper
+  // by them on the topic is not treated as a stranger to the question.
+  const aiQuestion = authorNames.length ? `${question} (the student is looking for work by ${authorNames.join(" and ")})` : question;
+  const highlighted = await highlightOnTopic(aiQuestion, papers);
   console.log(`[search] highlightPapers: ${papers.length} in -> ${highlighted.length} out`);
   // Highest suitability first (ties go to the paper more sources agreed on,
   // then the more cited). The 20 shown are the 20 most suitable, except that
@@ -1948,7 +2024,10 @@ async function runSearch(question, minYear, oaOpts) {
   // last places, as long as the AI judged them genuinely relevant — so a
   // landmark paper or key review isn't lost for scoring a few points lower
   // than twenty narrower ones.
-  const results = selectFinal(highlighted, { cap: 20, reserve: 3, minSuitability: 50, stats: importance });
+  const picked = selectFinal(highlighted, { cap: 20, reserve: 3, minSuitability: 50, stats: importance });
+  // Papers by the named author come first, each checked against its real author list.
+  const authored = authorNames.length ? authorFirst(picked, authorNames) : null;
+  const results = authored ? authored.results : picked;
 
   // Full-text availability is checked only on the papers actually being
   // shown, not the full candidate pool — checking all 36 candidates
@@ -1989,13 +2068,21 @@ async function runSearch(question, minYear, oaOpts) {
   const toReHighlight = withExcerpts.filter(p => p.methodsExcerpt || p.resultsExcerpt);
   let finalResults = withExcerpts;
   if (toReHighlight.length > 0) {
-    const redone = await reHighlightWithFullText(question, toReHighlight);
+    const redone = await reHighlightWithFullText(aiQuestion, toReHighlight);
     const redoneFor = new Map(toReHighlight.map((p, i) => [p, redone[i]]));
     finalResults = withExcerpts.map(p => redoneFor.get(p) || p);
     console.log(`[search] re-highlighted with full text: ${toReHighlight.length} candidates, ${redone.filter((p, i) => p !== toReHighlight[i]).length} improved`);
   }
 
-  return { value: { results: finalResults, searchQuery }, cacheable: quality === "ok" };
+  return {
+    value: {
+      results: finalResults,
+      searchQuery,
+      // Tells the page which names were searched for and how many papers really are by them.
+      ...(authored ? { authorSearch: { names: authorNames, matched: authored.matched } } : {})
+    },
+    cacheable: quality === "ok"
+  };
 }
 
 app.get("/api/search", requireAuth, limitFull, async (req, res) => {
@@ -2019,7 +2106,7 @@ app.get("/api/search", requireAuth, limitFull, async (req, res) => {
     // gets the answer already worked out (see response-cache.js). Admins can add
     // ?fresh=1 to see what a search really returns right now.
     const { value, status } = await searchCache.run(
-      searchCacheKey("search-v3", question, { minYear, includePaywalled }),
+      searchCacheKey("search-v4", question, { minYear, includePaywalled }),
       () => runSearch(question, minYear, oaOpts),
       { bypass: req.query.fresh === "1" && isAdminEmail(req.email) }
     );
@@ -2239,7 +2326,7 @@ app.post("/api/plan", requireAuth, limitFull, async (req, res) => {
     // The same search as the Find sources tab, through the same cache: a student
     // who has just searched this question gets the papers without a second search.
     const { value } = await searchCache.run(
-      searchCacheKey("search-v3", input.question, { minYear: null, includePaywalled: false }),
+      searchCacheKey("search-v4", input.question, { minYear: null, includePaywalled: false }),
       () => runSearch(input.question, null, { requireOA: true })
     );
     const results = Array.isArray(value?.results) ? value.results : [];
