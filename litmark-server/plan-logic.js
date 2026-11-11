@@ -120,13 +120,21 @@ function compactPaper(p, ref, quote) {
   return {
     ref,
     title: oneLine(p.title, 220),
-    authors: oneLine(p.authors, 160),
+    authors: oneLine(p.authors, 300),
     cite: oneLine(shortCite(p), 60),
     journal: oneLine(p.journal && p.journal !== "Unknown venue" ? p.journal : "", 120),
     year: p.year ? oneLine(p.year, 8) : "",
     paperType: p.paperType ? oneLine(p.paperType, 40) : "",
     citedByCount: Number.isFinite(p.citedByCount) ? Math.max(0, Math.round(p.citedByCount)) : null,
-    url: safeHttp(p.url),
+    // Search results carry their link as oaUrl (free to read); a DOI link is the
+    // fallback. Without this a real result would have no link at all.
+    url: safeHttp(p.oaUrl) || safeHttp(p.url) || (p.doi ? safeHttp(`https://doi.org/${String(p.doi).trim()}`) : null),
+    // What a folder needs to keep the paper and export its citation.
+    doi: p.doi ? oneLine(p.doi, 200) : null,
+    authorList: Array.isArray(p.authorList) ? p.authorList.slice(0, 25) : undefined,
+    authorTotal: Number.isFinite(p.authorTotal) ? p.authorTotal : undefined,
+    abstract: p.abstract ? String(p.abstract).slice(0, 4000) : "",
+    isOA: typeof p.isOA === "boolean" ? p.isOA : undefined,
     quote: { text: quote.text, section: quote.section }
   };
 }

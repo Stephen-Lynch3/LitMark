@@ -206,3 +206,19 @@ test("20. the plan holds no essay text: only headings, cover lines, citations an
   assert.equal(plan.outline.reduce((a, s) => a + s.words, 0), 5000);
   assert.ok(plan.outline.every(s => s.words % 50 === 0), "long pieces are budgeted in fifties");
 });
+
+test("21. real search results (link in oaUrl) keep their link, and carry what a folder needs", () => {
+  const r = pickKeyPapers([
+    { title: "A review", authors: "A One, B Two, C Three", year: 2022, paperType: "Systematic review", suitability: 90, citedByCount: 10,
+      oaUrl: "https://example.org/free.pdf", doi: "10.1000/abc", abstract: "Abstract text.", authorList: [{ family: "One", given: "A" }], authorTotal: 3, isOA: true,
+      highlights: [{ text: "This is a readable checked quote from the paper.", section: "abstract" }] },
+    { title: "No link at all but a doi", authors: "D Four", year: 2020, paperType: "Meta-analysis", suitability: 80, doi: "10.1000/xyz",
+      highlights: [{ text: "Another readable checked quote from the paper.", section: "abstract" }] }
+  ]);
+  assert.equal(r.reviews[0].url, "https://example.org/free.pdf");
+  assert.equal(r.reviews[0].doi, "10.1000/abc");
+  assert.equal(r.reviews[0].abstract, "Abstract text.");
+  assert.equal(r.reviews[0].authorTotal, 3);
+  assert.equal(r.reviews[0].isOA, true);
+  assert.equal(r.reviews[1].url, "https://doi.org/10.1000/xyz");
+});
