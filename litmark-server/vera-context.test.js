@@ -190,7 +190,7 @@ test("the library block notes papers that were left out and handles an empty lib
 
 test("the system prompt covers every citation tag, Hit the Mark and the safety rule", () => {
   const sys = buildVeraSystemPrompt({ supportEmail: "help@example.com" });
-  for (const tag of ["Faithful", "Overstated", "Misrepresented", "Fabricated", "Not original source", "Debunked", "Unable to verify", "Hit the Mark", "Citation Accuracy"]) {
+  for (const tag of ["Faithful", "Overstated", "Misrepresented", "Fabricated", "Not original source", "Retracted or challenged", "Unable to verify", "Hit the Mark", "Citation Accuracy"]) {
     assert.ok(sys.includes(tag), `missing ${tag}`);
   }
   assert.match(sys, /NEVER writes/);
