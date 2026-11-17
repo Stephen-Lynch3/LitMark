@@ -209,6 +209,7 @@ function buildBody(plan, linkId) {
         ? run(badge.replace(/ /g, "\u00a0"), { size: 8.5, color: SOFT })
         : run(`\u00a0${badge.replace(/ /g, "\u00a0")}\u00a0`, { b: true, size: 7.5, color: "FFFFFF", fill: BLUE })), { before: 80, after: 10, keepNext: true }) +
       (meta ? para(run(meta, { size: 8.5, color: SOFT }), { after: 20, keepNext: true }) : "") +
+      (p.forSection ? para(run("For: ", { b: true, size: 8.5, color: SOFT }) + run(p.forSection, { size: 8.5, color: SOFT }), { after: 20, keepNext: true }) : "") +
       para(run("“" + p.quote.text + "”", { size: 9.5, color: INK, fill: LIME }), { after: 40 })
     );
   };
@@ -224,6 +225,12 @@ function buildBody(plan, linkId) {
     cell(colW[1], column("Most cited in this area", plan.mostCited || [], p => `Cited by ${fmt(p.citedByCount)}`,
       "No paper in these results has enough citations to count as most cited."), { fill: PAPER, margins: "80 120 80 120", borders: cellBorders("left") })
   ]));
+
+  // Papers found for the sections the key papers don't cover
+  if ((plan.sectionPapers || []).length) {
+    out.push(para(run("For your other sections", { b: true, size: 8.5, color: SOFT }), { before: 120, after: 20, keepNext: true }));
+    out.push(plan.sectionPapers.map(p => paperBlock(p, Number.isFinite(p.citedByCount) && p.citedByCount > 0 ? `Cited by ${fmt(p.citedByCount)}` : (p.paperType || "Paper"))).join(""));
+  }
 
   // Outline
   out.push(para(run("Outline", { b: true, size: 12, color: INK }), { before: 200, after: 40, keepNext: true, border: { side: "bottom", color: LIME, size: 12 } }));
@@ -241,7 +248,7 @@ function buildBody(plan, linkId) {
     ).join("");
     const line = border("bottom", "E3E1D5", 4);
     const rows = plan.outline.map(s => {
-      const start = s.startWith && s.startWith.length ? s.startWith.map(x => x.cite).join(", ") : (s.heading === "Conclusion" ? "None needed" : "Find your own");
+      const start = s.startWith && s.startWith.length ? s.startWith.map(x => x.cite).join(", ") : (s.heading === "Conclusion" ? "None needed" : "Use the search link");
       return [
         cell(w[0], para(run(s.heading, { b: true, size: 9, color: INK })), { borders: line, margins: "60 80 60 80" }),
         cell(w[1], para(run(fmt(s.words), { b: true, size: 9, color: INK }), { align: "right" }), { borders: line, margins: "60 80 60 80" }),

@@ -182,6 +182,84 @@ export function pickKeyPapers(results, { reviews = 2, cited = 2, minSuitability 
 }
 
 // ---------------------------------------------------------------------
+// A paper for every section
+// ---------------------------------------------------------------------
+
+const SECTION_STOP = new Set(("about above after again against also among because been before being between both could does during each "
+  + "from have having into more most other over said same should some such than that their them then there these they this those "
+  + "through under until very were what when where which while with within would your evidence research studies study "
+  + "discuss evaluate explain consider critically").split(" "));
+
+const sectionTerms = text => [...new Set(
+  (String(text ?? "").toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) || []).filter(w => !SECTION_STOP.has(w))
+)];
+
+// The key papers cover only a few sections, so the rest used to say "Find your
+// own". Here the code looks through the papers the search already found and
+// gives each of those sections the best match, judged by the section's own
+// heading and search words appearing in the paper's title and abstract. A paper
+// has to meet the same standard as the key papers (a checked quote, not retracted,
+// not a protocol, a good enough fit), and a section with no real match is left
+// as it was: nothing is invented to fill the gap.
+//
+// body: cleanOutline's output. Returns { body, extras }: the sections with
+// `anchors` filled in where a match was found, and the compact papers for any
+// that are new (refs S1, S2, ...). Pure; the inputs are not changed.
+export function pickSectionPapers(body, results, picks, { minSuitability = 60, minScore = 3, minTerms = 2 } = {}) {
+  const sections = Array.isArray(body) ? body : [];
+  const keyByKey = new Map([...(picks?.reviews || []), ...(picks?.mostCited || [])].map(p => [paperKey(p), p.ref]));
+  const seen = new Set();
+  const pool = [];
+  for (const p of Array.isArray(results) ? results : []) {
+    if (!p || p.retracted || p.paperType === "Study protocol") continue;
+    if (!Number.isFinite(p.suitability) || p.suitability < minSuitability) continue;
+    const quote = pickQuote(p.highlights);
+    if (!quote) continue;
+    const key = paperKey(p);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    pool.push({
+      p, quote, key,
+      title: String(p.title ?? "").toLowerCase(),
+      abstract: String(p.abstract ?? "").toLowerCase()
+    });
+  }
+
+  const taken = new Set();
+  const extras = [];
+  const outBody = sections.map(sec => {
+    if (Array.isArray(sec.anchors) && sec.anchors.length) return sec;
+    const terms = sectionTerms(`${sec.heading} ${sec.query} ${sec.query}`);
+    if (!terms.length) return sec;
+    let best = null;
+    for (const c of pool) {
+      if (taken.has(c.key)) continue;
+      let score = 0;
+      let hit = 0;
+      for (const t of terms) {
+        const inTitle = c.title.includes(t);
+        const inAbstract = c.abstract.includes(t);
+        if (inTitle) score += 2;
+        else if (inAbstract) score += 1;
+        if (inTitle || inAbstract) hit += 1;
+      }
+      if (hit < minTerms || score < minScore) continue;
+      const rank = score * 1000 + (Number.isFinite(c.p.suitability) ? c.p.suitability : 0);
+      if (!best || rank > best.rank) best = { c, rank };
+    }
+    if (!best) return sec;
+    taken.add(best.c.key);
+    let ref = keyByKey.get(best.c.key);
+    if (!ref) {
+      ref = `S${extras.length + 1}`;
+      extras.push({ ...compactPaper(best.c.p, ref, best.c.quote), forSection: sec.heading });
+    }
+    return { ...sec, anchors: [ref] };
+  });
+  return { body: outBody, extras };
+}
+
+// ---------------------------------------------------------------------
 // Reading and checking the AI's outline
 // ---------------------------------------------------------------------
 
@@ -303,10 +381,10 @@ const CONCLUSION = {
 
 // input: cleanPlanInput's value. picks: pickKeyPapers' output. body: cleanOutline's
 // output (may be empty). Returns the plan the app shows and the Word file is built from.
-export function assemblePlan(input, picks, body, { now = new Date() } = {}) {
-  const papers = [...picks.reviews, ...picks.mostCited];
+export function assemblePlan(input, picks, body, { now = new Date(), extras = [] } = {}) {
+  const papers = [...picks.reviews, ...picks.mostCited, ...extras];
   const byRef = new Map(papers.map(p => [p.ref, p]));
-  const startWith = refs => refs.map(r => byRef.get(r)).filter(Boolean).map(p => ({ ref: p.ref, cite: p.cite }));
+  const startWith = refs => refs.map(r => byRef.get(r)).filter(Boolean).map(p => ({ ref: p.ref, cite: p.cite, title: p.title, url: p.url || null }));
 
   let outline = [];
   if (body.length) {
@@ -329,6 +407,7 @@ export function assemblePlan(input, picks, body, { now = new Date() } = {}) {
     builtOn: now.toISOString().slice(0, 10),
     keyReviews: picks.reviews,
     mostCited: picks.mostCited,
+    sectionPapers: extras,
     outline,
     outlineTotal: outline.reduce((a, s) => a + s.words, 0)
   };

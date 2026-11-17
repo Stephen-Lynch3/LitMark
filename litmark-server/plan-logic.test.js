@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   allocateWords, assemblePlan, bodySectionRange, cleanOutline, cleanPlanInput,
-  parseOutlineReply, pickKeyPapers, pickQuote, shortCite
+  parseOutlineReply, pickKeyPapers, pickQuote, pickSectionPapers, shortCite
 } from "./plan-logic.js";
 
 // ---------- what the student typed ----------
@@ -222,4 +222,74 @@ test("21. real search results (link in oaUrl) keep their link, and carry what a 
   assert.equal(r.reviews[0].authorTotal, 3);
   assert.equal(r.reviews[0].isOA, true);
   assert.equal(r.reviews[1].url, "https://doi.org/10.1000/xyz");
+});
+
+// ---------- a paper for every section ----------
+
+const mkSec = (title, abstract, extra = {}) => ({
+  title, abstract, authors: "Ada Okafor, Ben Hart", year: 2020, journal: "J Test",
+  suitability: 80, paperType: "Journal article", citedByCount: 5, doi: `10.1/${title.length}${abstract.length}`,
+  highlights: [{ text: "This is a checked sentence taken from the paper itself.", section: "abstract" }],
+  ...extra
+});
+const noKey = { reviews: [], mostCited: [] };
+const sec = (heading, query, anchors = []) => ({ heading, cover: "x".repeat(20), anchors, weight: 5, query });
+
+test("20. a section with no key paper gets the best matching paper from the search results", () => {
+  const results = [
+    mkSec("Anchoring bias in judgement", "Anchoring and adjustment errors in estimates"),
+    mkSec("Gardening for beginners", "Soil and seeds")
+  ];
+  const { body, extras } = pickSectionPapers([sec("Anchoring and adjustment", "anchoring adjustment bias")], results, noKey);
+  assert.equal(body[0].anchors.length, 1);
+  assert.equal(extras.length, 1);
+  assert.equal(extras[0].ref, "S1");
+  assert.match(extras[0].title, /Anchoring/);
+  assert.equal(extras[0].forSection, "Anchoring and adjustment");
+});
+
+test("21. nothing is invented: a section with no real match is left alone", () => {
+  const results = [mkSec("Gardening for beginners", "Soil and seeds")];
+  const { body, extras } = pickSectionPapers([sec("Anchoring and adjustment", "anchoring adjustment bias")], results, noKey);
+  assert.deepEqual(body[0].anchors, []);
+  assert.equal(extras.length, 0);
+});
+
+test("22. weak, retracted, protocol and quote-less papers are never used, and a section that already has papers is kept", () => {
+  const results = [
+    mkSec("Anchoring adjustment bias weak", "anchoring adjustment bias", { suitability: 30 }),
+    mkSec("Anchoring adjustment bias retracted", "anchoring adjustment bias", { retracted: true }),
+    mkSec("Anchoring adjustment bias protocol", "anchoring adjustment bias", { paperType: "Study protocol" }),
+    mkSec("Anchoring adjustment bias no quote", "anchoring adjustment bias", { highlights: [] })
+  ];
+  const input = [sec("Anchoring", "anchoring adjustment bias"), sec("Kept", "anchoring", ["R1"])];
+  const { body, extras } = pickSectionPapers(input, results, noKey);
+  assert.deepEqual(body[0].anchors, []);
+  assert.deepEqual(body[1].anchors, ["R1"]);
+  assert.equal(extras.length, 0);
+  assert.deepEqual(input[0].anchors, []); // the input is not changed
+});
+
+test("23. two sections do not get the same paper, and a key paper is reused by its own ref", () => {
+  const results = [
+    mkSec("Anchoring adjustment bias review", "anchoring adjustment bias costs", { paperType: "Review" }),
+    mkSec("Representativeness heuristic base rates", "representativeness heuristic base rate neglect")
+  ];
+  const picks = pickKeyPapers(results, {});
+  const keyRef = picks.reviews[0].ref;
+  const { body, extras } = pickSectionPapers(
+    [sec("Anchoring costs", "anchoring adjustment bias"), sec("Representativeness", "representativeness heuristic base rate")],
+    results, picks);
+  assert.equal(body[0].anchors[0], keyRef);
+  assert.match(extras[0].title, /Representativeness/);
+  assert.notEqual(body[0].anchors[0], body[1].anchors[0]);
+});
+
+test("24. assemblePlan shows the extra papers in the Start with column, with a link", () => {
+  const results = [mkSec("Anchoring bias in judgement", "anchoring adjustment errors", { oaUrl: "https://example.org/a" })];
+  const { body, extras } = pickSectionPapers([sec("Anchoring", "anchoring adjustment errors")], results, noKey);
+  const plan = assemblePlan({ question: "q", type: "Essay", wordCount: 1500 }, noKey, body, { extras });
+  assert.equal(plan.sectionPapers.length, 1);
+  assert.equal(plan.outline[1].startWith[0].ref, "S1");
+  assert.equal(plan.outline[1].startWith[0].url, "https://example.org/a");
 });

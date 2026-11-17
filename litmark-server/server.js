@@ -48,7 +48,7 @@ import { createSourceHealth, parseWatchList, repeatSourceLabels, runQuality, tal
 import { createOfficialData } from "./official-data.js";
 import { createPrimarySources } from "./primary-sources.js";
 import { buildLexiconQuery, extractJsonObject } from "./lexicon-dbs.js";
-import { assemblePlan, bodySectionRange, cleanOutline, cleanPlanInput, parseOutlineReply, pickKeyPapers } from "./plan-logic.js";
+import { assemblePlan, bodySectionRange, cleanOutline, cleanPlanInput, parseOutlineReply, pickKeyPapers, pickSectionPapers } from "./plan-logic.js";
 import { buildDocx, docxFilename } from "./plan-docx.js";
 import { addAuthorCandidates, authorFirst, authorMatches, buildAuthorPrompt, cleanAuthorNames, stripAuthorNames } from "./author-search.js";
 
@@ -2397,8 +2397,11 @@ app.post("/api/plan", requireAuth, limitFull, async (req, res) => {
       // No headings is a smaller plan, not a failed one: the papers are still real and useful.
       console.error("[plan] outline step failed:", err?.message || err);
     }
-    const plan = assemblePlan(input, picks, body);
-    console.log(`[plan] "${input.question}" (${input.wordCount} words) -> ${picks.reviews.length} reviews, ${picks.mostCited.length} most cited, ${body.length} sections`);
+    // Sections the key papers don't cover get the best match from the same search results.
+    const filled = pickSectionPapers(body, results, picks);
+    body = filled.body;
+    const plan = assemblePlan(input, picks, body, { extras: filled.extras });
+    console.log(`[plan] "${input.question}" (${input.wordCount} words) -> ${picks.reviews.length} reviews, ${picks.mostCited.length} most cited, ${body.length} sections, ${filled.extras.length} extra section papers`);
 
     // Built here and sent with the plan, so the Download button needs no second request.
     let docx = null;
